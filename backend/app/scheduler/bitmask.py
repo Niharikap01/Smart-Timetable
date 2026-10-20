@@ -60,17 +60,20 @@ class OccupancyTracker:
         return bin(self._section[(section_id, day)]).count("1")
 
     def has_unit_conflict(
-        self, members: list, section_id: int, day: str, slot_index: int, duration: int,
+        self, members: list, section_id: int | list | set | tuple, day: str, slot_index: int, duration: int,
     ) -> bool:
-        """Group-aware check: each member's own teacher+room must be free,
-        but the section is checked/occupied ONCE for the whole unit — members
-        of the same group are *meant* to share the section's slot.
+        """Group-aware check of every section and resource used by a unit.
+
+        Ordinary linked units share one section period and use distinct rooms;
+        cross-section program electives occupy each member section but share a
+        single teacher/room when the sections attend one physical class.
         `members` is a list of (teacher_id, room_id) tuples.
         """
         mask = self._slot_mask(slot_index, duration)
-        if self._section[(section_id, day)] & mask:
+        section_ids = {section_id} if isinstance(section_id, int) else set(section_id)
+        if any(self._section[(sid, day)] & mask for sid in section_ids):
             return True
-        for teacher_id, room_id in members:
+        for teacher_id, room_id in set(members):
             if self._teacher[(teacher_id, day)] & mask:
                 return True
             if self._room[(room_id, day)] & mask:
@@ -78,20 +81,24 @@ class OccupancyTracker:
         return False
 
     def assign_unit(
-        self, members: list, section_id: int, day: str, slot_index: int, duration: int,
+        self, members: list, section_id: int | list | set | tuple, day: str, slot_index: int, duration: int,
     ) -> None:
         mask = self._slot_mask(slot_index, duration)
-        self._section[(section_id, day)] |= mask
-        for teacher_id, room_id in members:
+        section_ids = {section_id} if isinstance(section_id, int) else set(section_id)
+        for sid in section_ids:
+            self._section[(sid, day)] |= mask
+        for teacher_id, room_id in set(members):
             self._teacher[(teacher_id, day)] |= mask
             self._room[(room_id, day)] |= mask
 
     def unassign_unit(
-        self, members: list, section_id: int, day: str, slot_index: int, duration: int,
+        self, members: list, section_id: int | list | set | tuple, day: str, slot_index: int, duration: int,
     ) -> None:
         mask = self._slot_mask(slot_index, duration)
-        self._section[(section_id, day)] &= ~mask
-        for teacher_id, room_id in members:
+        section_ids = {section_id} if isinstance(section_id, int) else set(section_id)
+        for sid in section_ids:
+            self._section[(sid, day)] &= ~mask
+        for teacher_id, room_id in set(members):
             self._teacher[(teacher_id, day)] &= ~mask
             self._room[(room_id, day)] &= ~mask
 

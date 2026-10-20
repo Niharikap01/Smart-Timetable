@@ -9,6 +9,8 @@ class RoomConflictConstraint(Constraint):
     def check(self, candidate: ScheduleAssignment, existing: List[ScheduleAssignment], config: dict) -> ConstraintResult:
         for a in existing:
             if a.room_id == candidate.room_id and a.day == candidate.day:
+                if candidate.shared_room_group_id and a.shared_room_group_id == candidate.shared_room_group_id:
+                    continue
                 cand_slots = set(range(candidate.slot_index, candidate.slot_index + candidate.duration))
                 exist_slots = set(range(a.slot_index, a.slot_index + a.duration))
                 if cand_slots & exist_slots:
@@ -23,6 +25,8 @@ class RoomConflictConstraint(Constraint):
         for i, a in enumerate(assignments):
             for b in assignments[i + 1:]:
                 if a.room_id == b.room_id and a.day == b.day:
+                    if a.shared_room_group_id and a.shared_room_group_id == b.shared_room_group_id:
+                        continue
                     a_slots = set(range(a.slot_index, a.slot_index + a.duration))
                     b_slots = set(range(b.slot_index, b.slot_index + b.duration))
                     if a_slots & b_slots:

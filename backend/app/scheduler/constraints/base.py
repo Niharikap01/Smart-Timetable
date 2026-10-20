@@ -31,6 +31,11 @@ class ScheduleAssignment:
     required_room_type: str = "lecture"
     faculty_type: str = "regular"
     link_group_id: Optional[str] = None
+    shared_room_group_id: Optional[str] = None
+    required_capacity: int = 0
+    program_elective_group_id: Optional[int] = None
+    program_elective_student_count: int = 0
+    room_number: str = ""
 
 
 class Constraint(ABC):

@@ -45,6 +45,11 @@ export const importRecords = (entity, file) => {
 
 export const estimateSectionStrengths = () => api.post('/api/import/estimate-section-strengths');
 
+// Program electives are stored by semester with their joint-section groups.
+export const getProgramElectives = (semester) => api.get('/api/program-electives', { params: { semester } });
+export const createProgramElective = (data) => api.post('/api/program-electives', data);
+export const deleteProgramElective = (id) => api.delete(`/api/program-electives/${id}`);
+
 // Sections
 export const getSections = (params) => api.get('/api/sections', { params });
 export const createSection = (data) => api.post('/api/sections', data);

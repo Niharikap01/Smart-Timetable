@@ -1,7 +1,7 @@
 from fastapi import APIRouter
 from app.api.routes import (
     auth, teachers, sections, courses, rooms,
-    timeslots, availability, reserved_slots, timetable, imports, constraints,
+    timeslots, availability, reserved_slots, timetable, imports, constraints, program_electives,
 )
 
 api_router = APIRouter()
@@ -17,3 +17,4 @@ api_router.include_router(reserved_slots.router)
 api_router.include_router(timetable.router)
 api_router.include_router(imports.router)
 api_router.include_router(constraints.router)
+api_router.include_router(program_electives.router)

@@ -25,6 +25,9 @@ class SchedulingSession:
     # pair (SE Lab batches 1/2 + DP Lab batches 3/4) running in parallel.
     # None means "not part of any group" (the common case).
     link_group_id: Optional[str] = None
+    program_elective_group_id: Optional[int] = None
+    program_elective_student_count: int = 0
+    shared_room_group_id: Optional[str] = None
 
 
 @dataclass
@@ -49,6 +52,7 @@ class Candidate:
     room_id: int
     room_type: str
     room_capacity: int
+    room_number: str = ""
 
     @property
     def key(self) -> Tuple[str, int, int]:

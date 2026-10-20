@@ -8,6 +8,7 @@ from app.models.timetable import GeneratedSchedule, TimetableSession, ScheduleSt
 from app.models.reserved_slot import ReservedSlot
 from app.models.user import User
 from app.models.constraint_profile import ConstraintProfile
+from app.models.program_elective import ProgramElective, ProgramElectiveGroup
 
 __all__ = [
     "Teacher", "FacultyType",
@@ -20,4 +21,5 @@ __all__ = [
     "ReservedSlot",
     "User",
     "ConstraintProfile",
+    "ProgramElective", "ProgramElectiveGroup",
 ]

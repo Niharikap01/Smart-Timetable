@@ -37,7 +37,11 @@ class Course(Base):
     # Free-text label for which batches this offering serves, e.g. "B1/B2".
     # Not used by the solver — for display/reporting only.
     batch_label = Column(String(50), nullable=True)
+    # Program electives materialize one course row per participating section;
+    # the shared group id makes those rows one teaching/room assignment.
+    program_elective_group_id = Column(Integer, ForeignKey("program_elective_groups.id"), nullable=True, index=True)
 
     section = relationship("Section", back_populates="courses")
     teacher = relationship("Teacher", back_populates="courses")
     timetable_sessions = relationship("TimetableSession", back_populates="course")
+    program_elective_group = relationship("ProgramElectiveGroup", back_populates="courses")

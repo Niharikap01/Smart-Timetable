@@ -26,6 +26,8 @@ def expand_sessions(courses: list) -> List[SchedulingSession]:
             ftype = c.get("faculty_type", "regular")
             priority = c.get("priority", 5)
             link_group = c.get("link_group")
+            elective_group_id = c.get("program_elective_group_id")
+            elective_student_count = c.get("program_elective_student_count", 0)
         else:
             cid = c.id
             code = getattr(c, "course_code", "")
@@ -42,13 +44,20 @@ def expand_sessions(courses: list) -> List[SchedulingSession]:
                 ftype = ftype.value
             priority = getattr(c, "priority", 5)
             link_group = getattr(c, "link_group", None)
+            elective_group_id = getattr(c, "program_elective_group_id", None)
+            elective_student_count = getattr(c, "program_elective_student_count", 0)
 
         for sn in range(1, weekly + 1):
             # Instance sn of a grouped course is tied to instance sn of every
             # other course in the same (section, link_group) — e.g. the 1st
             # weekly occurrence of DPD, ECOM and IDPS all land on one slot
             # together, the 2nd occurrence on another shared slot, etc.
-            link_group_id = f"{sec_id}:{link_group}:{sn}" if link_group else None
+            if elective_group_id is not None:
+                link_group_id = f"PE:{elective_group_id}:{sn}"
+                shared_room_group_id = link_group_id
+            else:
+                link_group_id = f"{sec_id}:{link_group}:{sn}" if link_group else None
+                shared_room_group_id = None
 
             sessions.append(SchedulingSession(
                 session_id=f"{code}-{ctype}-S{sec_id}-{sn}",
@@ -65,6 +74,9 @@ def expand_sessions(courses: list) -> List[SchedulingSession]:
                 course_name=name,
                 course_code=code,
                 link_group_id=link_group_id,
+                program_elective_group_id=elective_group_id,
+                program_elective_student_count=elective_student_count,
+                shared_room_group_id=shared_room_group_id,
             ))
     return sessions
 

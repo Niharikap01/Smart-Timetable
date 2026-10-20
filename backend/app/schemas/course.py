@@ -42,4 +42,5 @@ class CourseUpdate(BaseModel):
 
 class CourseResponse(CourseBase):
     id: int
+    program_elective_group_id: Optional[int] = None
     model_config = {"from_attributes": True}

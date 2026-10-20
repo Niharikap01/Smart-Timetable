@@ -116,77 +116,188 @@ class CPSATSolver:
         section_occupancy = self._section_occupancy(model, choices)
         self._add_compact_day_constraints(model, section_occupancy, cfg)
         self._add_start_time_constraints(model, section_occupancy, cfg)
-        self._add_optional_balance_objective(model, choices, cfg)
 
-        solver = cp_model.CpSolver()
-        solver.parameters.max_time_in_seconds = max(1, self.config.timeout_seconds)
-        solver.parameters.num_search_workers = 8
-        solver.parameters.random_seed = 20261008
+        deadline = started + max(0.0, float(self.config.timeout_seconds))
 
-        status = solver.Solve(model)
-        elapsed = int((time.monotonic() - started) * 1000)
-        if status not in (cp_model.OPTIMAL, cp_model.FEASIBLE):
-            timed_out = status == cp_model.UNKNOWN
-            return SolverResult(
-                status="TIMEOUT" if timed_out else "FAILED",
-                sessions_expected=expected,
-                generation_time_ms=elapsed,
-                algorithm=self.algorithm,
-                bottlenecks=[
-                    "CP-SAT reached the time limit before finding a complete timetable."
-                    if timed_out else
-                    "CP-SAT found the supplied rooms, faculty availability, and timetable rules infeasible."
-                ],
-            )
-
+        last_bottlenecks: List[str] = []
+        solver = None
         assignments: List[ScheduleAssignment] = []
-        for choice in choices:
-            if solver.Value(choice.variable):
-                assignments.extend(self._build_assignments(choice.unit, choice.candidate))
+        warm_choices = self._warm_start_choices(choices, units, cfg.get("warm_start_slots", {}))
+        warm_seeded = False
 
-        if not self._allocate_rooms(assignments, rooms):
-            return SolverResult(
-                status="FAILED",
-                assignments=assignments,
-                sessions_scheduled=len(assignments),
-                sessions_expected=expected,
-                generation_time_ms=elapsed,
-                algorithm=self.algorithm,
-                backtracks=int(solver.NumConflicts()),
-                bottlenecks=["The selected times could not be matched to distinct compatible rooms."],
-            )
+        # First try to complete the previous valid timetable while keeping its
+        # matching placements fixed in a temporary model copy. For imports
+        # that add only a few sessions, this turns the old schedule into a
+        # near-complete solution instead of asking CP-SAT to rediscover it.
+        remaining = deadline - time.monotonic()
+        seed_budget = min(5.0, max(0.0, remaining * 0.35))
+        if warm_choices and seed_budget > 0.25:
+            seed_model = model.clone()
+            for choice in warm_choices.values():
+                seed_variable = seed_model.get_bool_var_from_proto_index(choice.variable.index)
+                seed_model.Add(seed_variable == 1)
+            seed_solver = self._new_solver(seed_budget)
+            seed_status = seed_solver.Solve(seed_model)
+            if seed_status in (cp_model.OPTIMAL, cp_model.FEASIBLE):
+                selected = [
+                    choice for choice in choices
+                    if seed_solver.BooleanValue(
+                        seed_model.get_bool_var_from_proto_index(choice.variable.index)
+                    )
+                ]
+                seed_assignments = [
+                    assignment
+                    for choice in selected
+                    for assignment in self._build_assignments(choice.unit, choice.candidate)
+                ]
+                if self._allocate_rooms(seed_assignments, rooms) and not validate_schedule(seed_assignments, cfg):
+                    solver = seed_solver
+                    assignments = seed_assignments
+                    warm_seeded = True
+                    # The completed seed is also a complete hint for the
+                    # unconstrained model used for any optional optimization.
+                    selected_ids = {id(choice) for choice in selected}
+                    for choice in choices:
+                        model.AddHint(choice.variable, int(id(choice) in selected_ids))
 
-        # Retain the independent existing validation layer as a final safety
-        # net.  This means a solver-model regression cannot silently publish
-        # a timetable that violates one of the college rules.
-        violations = validate_schedule(assignments, cfg)
-        if violations:
-            return SolverResult(
-                status="FAILED",
-                assignments=assignments,
-                sessions_scheduled=len(assignments),
-                sessions_expected=expected,
-                generation_time_ms=elapsed,
-                hard_constraint_violations=len(violations),
-                algorithm=self.algorithm,
-                backtracks=int(solver.NumConflicts()),
-                restarts=0,
-                bottlenecks=[violation.message for violation in violations[:5]],
-            )
+        if not warm_seeded:
+            self._add_warm_start_hints(model, choices, warm_choices)
+            if warm_choices:
+                # Preserve previous course times where possible, moving only
+                # the units needed to place the new or changed offerings.
+                # This gives CP-SAT a useful direction when a timetable is
+                # almost valid but additions require a small neighbourhood of
+                # existing classes to move.
+                model.Maximize(sum(choice.variable for choice in warm_choices.values()))
+
+        while not warm_seeded:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0.01:
+                return SolverResult(
+                    status="TIMEOUT",
+                    sessions_expected=expected,
+                    generation_time_ms=int((time.monotonic() - started) * 1000),
+                    algorithm=self.algorithm,
+                    bottlenecks=last_bottlenecks or [
+                        "CP-SAT reached the time limit before finding a complete timetable."
+                    ],
+                )
+
+            solver = self._new_solver(remaining)
+            status = solver.Solve(model)
+            if status not in (cp_model.OPTIMAL, cp_model.FEASIBLE):
+                timed_out = status == cp_model.UNKNOWN
+                return SolverResult(
+                    status="TIMEOUT" if timed_out else "FAILED",
+                    sessions_expected=expected,
+                    generation_time_ms=int((time.monotonic() - started) * 1000),
+                    algorithm=self.algorithm,
+                    bottlenecks=last_bottlenecks or [
+                        "CP-SAT reached the time limit before finding a complete timetable."
+                        if timed_out else
+                        "CP-SAT found the supplied rooms, faculty availability, and timetable rules infeasible."
+                    ],
+                )
+
+            selected = [choice for choice in choices if solver.Value(choice.variable)]
+            assignments = [
+                assignment
+                for choice in selected
+                for assignment in self._build_assignments(choice.unit, choice.candidate)
+            ]
+            if self._allocate_rooms(assignments, rooms):
+                violations = validate_schedule(assignments, cfg)
+                if not violations:
+                    break
+                last_bottlenecks = [violation.message for violation in violations[:5]]
+            else:
+                last_bottlenecks = [
+                    "The selected times could not be matched to distinct compatible rooms."
+                ]
+
+            # Room matching is a separate step because it is independent of
+            # time choice in most cases. If a chosen pattern cannot be matched,
+            # exclude just that combination and let CP-SAT try another one.
+            model.Add(sum(choice.variable for choice in selected) <= len(selected) - 1)
+
+        best_solver = solver
+        best_assignments = assignments
+
+        # Hard feasibility comes first. Only spend leftover time on the
+        # optional balance objective after a fully validated timetable exists.
+        self._add_optional_balance_objective(model, choices, cfg, warm_choices.values())
+        remaining = deadline - time.monotonic()
+        optimization_budget = min(5.0, max(0.0, remaining * 0.25))
+        if cfg.get("PREFER_BALANCED_DAYS", False) and optimization_budget > 0.25:
+            optimizer = self._new_solver(optimization_budget)
+            optimized_status = optimizer.Solve(model)
+            if optimized_status in (cp_model.OPTIMAL, cp_model.FEASIBLE):
+                optimized_choices = [choice for choice in choices if optimizer.Value(choice.variable)]
+                optimized_assignments = [
+                    assignment
+                    for choice in optimized_choices
+                    for assignment in self._build_assignments(choice.unit, choice.candidate)
+                ]
+                if self._allocate_rooms(optimized_assignments, rooms) and not validate_schedule(optimized_assignments, cfg):
+                    best_solver = optimizer
+                    best_assignments = optimized_assignments
 
         return SolverResult(
             status="VALID",
-            assignments=assignments,
-            sessions_scheduled=len(assignments),
+            assignments=best_assignments,
+            sessions_scheduled=len(best_assignments),
             sessions_expected=expected,
-            generation_time_ms=elapsed,
+            generation_time_ms=int((time.monotonic() - started) * 1000),
             hard_constraint_violations=0,
             algorithm=self.algorithm,
             # CP-SAT does not use chronological backtracking.  Conflicts are
             # the closest useful diagnostic exposed by OR-Tools.
-            backtracks=int(solver.NumConflicts()),
+            backtracks=int(best_solver.NumConflicts()),
             restarts=0,
         )
+
+    @staticmethod
+    def _new_solver(remaining_seconds: float):
+        solver = cp_model.CpSolver()
+        solver.parameters.max_time_in_seconds = max(0.01, remaining_seconds)
+        solver.parameters.num_search_workers = 8
+        solver.parameters.random_seed = 20261008
+        return solver
+
+    @staticmethod
+    def _warm_start_choices(choices, units, warm_start_slots: dict) -> dict:
+        choices_by_unit: DefaultDict[int, List[_Choice]] = defaultdict(list)
+        for choice in choices:
+            choices_by_unit[choice.unit_index].append(choice)
+
+        selected_by_unit = {}
+        for unit_index, unit in enumerate(units):
+            prior_slots = [
+                warm_start_slots.get((member.course_id, member.section_id, member.session_number))
+                for member in unit
+            ]
+            if not prior_slots or any(slot is None for slot in prior_slots):
+                continue
+            if len(set(prior_slots)) != 1:
+                continue
+            prior_day, prior_slot = prior_slots[0]
+            unit_choices = choices_by_unit[unit_index]
+            matching = next((
+                choice for choice in unit_choices
+                if choice.candidate.day == prior_day and choice.candidate.slot_index == prior_slot
+            ), None)
+            if matching is not None:
+                selected_by_unit[unit_index] = matching
+        return selected_by_unit
+
+    @staticmethod
+    def _add_warm_start_hints(model, choices, selected_by_unit: dict) -> None:
+        choices_by_unit: DefaultDict[int, List[_Choice]] = defaultdict(list)
+        for choice in choices:
+            choices_by_unit[choice.unit_index].append(choice)
+        for unit_index, matching in selected_by_unit.items():
+            for choice in choices_by_unit[unit_index]:
+                model.AddHint(choice.variable, int(choice is matching))
 
     def _failed(
         self, expected: int, started: float, unscheduled: List[str], bottlenecks: List[str],
@@ -223,6 +334,11 @@ class CPSATSolver:
                 required_room_type=member.required_room_type,
                 faculty_type=member.faculty_type,
                 link_group_id=member.link_group_id,
+                shared_room_group_id=member.shared_room_group_id,
+                required_capacity=max(member.section_strength, member.program_elective_student_count),
+                program_elective_group_id=member.program_elective_group_id,
+                program_elective_student_count=member.program_elective_student_count,
+                room_number=room.room_number,
             ))
         return assignments
 
@@ -269,58 +385,80 @@ class CPSATSolver:
         section_slots: DefaultDict[tuple, List[object]] = defaultdict(list)
 
         for choice in choices:
-            section_id = choice.unit[0].section_id
-            duration = choice.unit[0].duration
-            for slot in range(choice.candidate.slot_index, choice.candidate.slot_index + duration):
-                section_slots[(section_id, choice.candidate.day, slot)].append(choice.variable)
-            for member in choice.unit:
-                for slot in range(choice.candidate.slot_index, choice.candidate.slot_index + member.duration):
-                    teacher_slots[(member.teacher_id, choice.candidate.day, slot)].append(choice.variable)
+            for section_id in {member.section_id for member in choice.unit}:
+                for slot in range(choice.candidate.slot_index, choice.candidate.slot_index + choice.unit[0].duration):
+                    section_slots[(section_id, choice.candidate.day, slot)].append(choice.variable)
+            for teacher_id in {member.teacher_id for member in choice.unit}:
+                for slot in range(choice.candidate.slot_index, choice.candidate.slot_index + choice.unit[0].duration):
+                    teacher_slots[(teacher_id, choice.candidate.day, slot)].append(choice.variable)
 
         self._add_at_most_one(model, teacher_slots)
         self._add_at_most_one(model, section_slots)
 
     @staticmethod
     def _allocate_rooms(assignments: List[ScheduleAssignment], rooms: List[RoomInfo]) -> bool:
-        """Match selected sessions to compatible rooms without slot overlap."""
-        options = {
-            assignment.session_id: sorted(
-                (room for room in rooms
-                 if room.room_type == assignment.required_room_type
-                 and room.capacity >= assignment.section_strength),
-                key=lambda room: (room.capacity - assignment.section_strength, room.room_id),
-            )
-            for assignment in assignments
-        }
-        if any(not options[a.session_id] for a in assignments):
-            return False
+        """Match room units, keeping cross-section electives in one room."""
+        units_by_key = defaultdict(list)
+        for assignment in assignments:
+            key = ("shared", assignment.shared_room_group_id) if assignment.shared_room_group_id else ("session", assignment.session_id)
+            units_by_key[key].append(assignment)
 
-        ordered = sorted(
-            assignments,
-            key=lambda a: (len(options[a.session_id]), -a.duration, a.day, a.slot_index),
-        )
-        room_slots: Dict[int, set] = defaultdict(set)
+        room_units = []
+        large_room_numbers = {"DT-301", "DT-701", "DT-702"}
+        for unit in units_by_key.values():
+            shared = bool(unit[0].shared_room_group_id)
+            options = [
+                room for room in rooms
+                if all(
+                    room.room_type == assignment.required_room_type
+                    and room.capacity >= (assignment.required_capacity or assignment.section_strength)
+                    and (
+                        not shared
+                        or ((room.room_number or "").replace(" ", "").upper() in large_room_numbers)
+                        == (assignment.program_elective_student_count > 70)
+                    )
+                    for assignment in unit
+                )
+            ]
+            options.sort(key=lambda room: (
+                room.capacity - max(a.required_capacity or a.section_strength for a in unit),
+                room.room_id,
+            ))
+            if not options:
+                return False
+            room_units.append((unit, options))
 
-        def assign(index: int) -> bool:
-            if index == len(ordered):
-                return True
-            assignment = ordered[index]
-            occupied_slots = {
-                (assignment.day, slot)
-                for slot in range(assignment.slot_index, assignment.slot_index + assignment.duration)
-            }
-            for room in options[assignment.session_id]:
-                if room_slots[room.room_id].isdisjoint(occupied_slots):
-                    room_slots[room.room_id].update(occupied_slots)
-                    assignment.room_id = room.room_id
-                    assignment.room_type = room.room_type
-                    assignment.room_capacity = room.capacity
-                    if assign(index + 1):
-                        return True
-                    room_slots[room.room_id].difference_update(occupied_slots)
-            return False
+        room_units_by_day: DefaultDict[str, list] = defaultdict(list)
+        for unit, options in room_units:
+            room_units_by_day[unit[0].day].append((unit, options))
 
-        return assign(0)
+        for day_units in room_units_by_day.values():
+            ordered = sorted(day_units, key=lambda item: (len(item[1]), -item[0][0].duration, item[0][0].slot_index))
+            room_slots: Dict[int, set] = defaultdict(set)
+
+            def assign(index: int) -> bool:
+                if index == len(ordered):
+                    return True
+                unit, options = ordered[index]
+                assignment = unit[0]
+                occupied_slots = set(range(assignment.slot_index, assignment.slot_index + assignment.duration))
+                for room in options:
+                    if room_slots[room.room_id].isdisjoint(occupied_slots):
+                        room_slots[room.room_id].update(occupied_slots)
+                        for member in unit:
+                            member.room_id = room.room_id
+                            member.room_type = room.room_type
+                            member.room_capacity = room.capacity
+                            member.room_number = room.room_number
+                        if assign(index + 1):
+                            return True
+                        room_slots[room.room_id].difference_update(occupied_slots)
+                return False
+
+            if not assign(0):
+                return False
+
+        return True
 
     def _add_daily_load_constraints(self, model, choices: List[_Choice], cfg: dict) -> None:
         """C10/C12/C17: section lecture load, total load and faculty load."""
@@ -329,12 +467,16 @@ class CPSATSolver:
         teacher_loads: DefaultDict[tuple, List[object]] = defaultdict(list)
 
         for choice in choices:
+            by_section = defaultdict(list)
             for member in choice.unit:
-                key = (member.section_id, choice.candidate.day)
-                section_loads[key].append(member.duration * choice.variable)
-                if member.course_type == "lecture":
-                    lecture_loads[key].append(member.duration * choice.variable)
-                teacher_loads[(member.teacher_id, choice.candidate.day)].append(member.duration * choice.variable)
+                by_section[member.section_id].append(member)
+            for section_id, members in by_section.items():
+                key = (section_id, choice.candidate.day)
+                section_loads[key].append(choice.unit[0].duration * choice.variable)
+                if any(member.course_type == "lecture" for member in members):
+                    lecture_loads[key].append(choice.unit[0].duration * choice.variable)
+            for teacher_id in {member.teacher_id for member in choice.unit}:
+                teacher_loads[(teacher_id, choice.candidate.day)].append(choice.unit[0].duration * choice.variable)
 
         for terms in lecture_loads.values():
             model.Add(sum(terms) <= cfg.get("MAX_LECTURE_PERIODS_PER_DAY", 5))
@@ -353,10 +495,10 @@ class CPSATSolver:
         """
         choices_by_slot: DefaultDict[tuple, List[object]] = defaultdict(list)
         for choice in choices:
-            section_id = choice.unit[0].section_id
             duration = choice.unit[0].duration
-            for slot in range(choice.candidate.slot_index, choice.candidate.slot_index + duration):
-                choices_by_slot[(section_id, choice.candidate.day, slot)].append(choice.variable)
+            for section_id in {member.section_id for member in choice.unit}:
+                for slot in range(choice.candidate.slot_index, choice.candidate.slot_index + duration):
+                    choices_by_slot[(section_id, choice.candidate.day, slot)].append(choice.variable)
 
         occupancy: Dict[tuple, object] = {}
         for (section_id, day, slot), variables in choices_by_slot.items():
@@ -455,7 +597,9 @@ class CPSATSolver:
                 else:
                     model.Add(variable == 0)
 
-    def _add_optional_balance_objective(self, model, choices: List[_Choice], cfg: dict) -> None:
+    def _add_optional_balance_objective(
+        self, model, choices: List[_Choice], cfg: dict, warm_choices: Iterable[_Choice] = (),
+    ) -> None:
         """Prefer a spread, readable week without weakening hard rules."""
         if not cfg.get("PREFER_BALANCED_DAYS", False):
             return
@@ -493,5 +637,6 @@ class CPSATSolver:
         model.Maximize(
             1000 * sum(active_days)
             + 100 * sum(course_days)
+            + 1000 * sum(choice.variable for choice in warm_choices)
             - sum(room_waste_terms)
         )

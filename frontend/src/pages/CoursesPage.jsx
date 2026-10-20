@@ -19,7 +19,7 @@ export default function CoursesPage() {
   const load = () => {
     setLoading(true);
     Promise.all([getCourses(), getTeachers(), getSections()]).then(([c, t, s]) => {
-      setData(c.data.filter(course => course.active));
+      setData(c.data.filter(course => course.active && !course.program_elective_group_id));
       setTeachers(t.data.filter(teacher => teacher.active && !teacher.email?.toLowerCase().endsWith('@coordinator-import.local')));
       setSections(s.data);
       setLoading(false);

@@ -118,12 +118,22 @@ export default function TimetablePage() {
 
   const getCell = (day, slotIdx) => {
     const masterSlot = timeslotByDaySlot.get(`${day}::${slotIdx}`);
-    return sessions.filter(s => {
+    const matchingSessions = sessions.filter(s => {
       const sDay = s.day;
       if (masterSlot) return sDay === day && Number(s.timeslot_id) === Number(masterSlot.id);
       const startHour = Number(String(s.start_time || '').split(':')[0]);
       const slotMatch = Number.isFinite(startHour) && startHour - 8 === slotIdx;
       return sDay === day && slotMatch;
+    });
+    if (viewType === 'section') return matchingSessions;
+    const seenElectiveClasses = new Set();
+    return matchingSessions.filter(session => {
+      const groupId = courses[session.course_id]?.program_elective_group_id;
+      if (groupId == null) return true;
+      const classKey = `${groupId}:${session.day}:${session.timeslot_id}`;
+      if (seenElectiveClasses.has(classKey)) return false;
+      seenElectiveClasses.add(classKey);
+      return true;
     });
   };
 
@@ -404,6 +414,13 @@ export default function TimetablePage() {
                       >
                         {cellSessions.map((s) => {
                           const course = courses[s.course_id];
+                          const electiveSectionNames = course?.program_elective_group_id == null ? [] : [...new Set(
+                            allSessions
+                              .filter(session => session.day === s.day && Number(session.timeslot_id) === Number(s.timeslot_id)
+                                && courses[session.course_id]?.program_elective_group_id === course.program_elective_group_id)
+                              .map(session => sections[session.section_id])
+                              .filter(Boolean),
+                          )];
                           const isSelected = editMode && selectedSessionId === s.id;
                           const isSwapPick = editMode && swapPick === s.id;
                           return (
@@ -439,6 +456,7 @@ export default function TimetablePage() {
                           >
                             <div className="course">{course?.course_code || `Course #${s.course_id}`}</div>
                             <div className="course-name">{course?.course_name || 'Course details loading…'}</div>
+                            {electiveSectionNames.length > 1 && <div className="info">Sections together: {electiveSectionNames.join(', ')}</div>}
                             <div className="info">{teachers[s.teacher_id] || `T${s.teacher_id}`}</div>
                             <div className="info">{rooms[s.room_id] || `R${s.room_id}`}</div>
                             {course?.duration > 1 && <div className="info duration">Two consecutive periods</div>}

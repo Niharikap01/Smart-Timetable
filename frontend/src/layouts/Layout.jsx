@@ -5,6 +5,7 @@ const links = [
   { to: '/teachers', label: 'Faculty', code: 'FC' },
   { to: '/sections', label: 'Sections', code: 'SC' },
   { to: '/courses', label: 'Courses', code: 'CR' },
+  { to: '/program-electives', label: 'Program Electives', code: 'PE' },
   { to: '/rooms', label: 'Rooms', code: 'RM' },
   { to: '/timeslots', label: 'Timeslots', code: 'TS' },
   { to: '/constraints', label: 'Constraints', code: 'CX' },

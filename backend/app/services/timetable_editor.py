@@ -12,7 +12,7 @@ from typing import Dict, List, Optional, Tuple
 from sqlalchemy.orm import Session
 
 from app.core.config import settings
-from app.models import Course, Room, Section, Teacher, Timeslot, TeacherAvailability, ReservedSlot
+from app.models import Course, ProgramElectiveGroup, Room, Section, Teacher, Timeslot, TeacherAvailability, ReservedSlot
 from app.models.timetable import GeneratedSchedule, TimetableSession, ScheduleStatus
 from app.models.timeslot import DayOfWeek
 from app.scheduler.constraints.base import ScheduleAssignment
@@ -126,6 +126,11 @@ def _assignments_for_schedule(db: Session, schedule: GeneratedSchedule) -> Tuple
     ).all()
     course_ids = {s.course_id for s in sessions}
     courses = {c.id: c for c in db.query(Course).filter(Course.id.in_(course_ids)).all()} if course_ids else {}
+    elective_group_ids = {c.program_elective_group_id for c in courses.values() if c.program_elective_group_id is not None}
+    elective_groups = {
+        group.id: group
+        for group in db.query(ProgramElectiveGroup).filter(ProgramElectiveGroup.id.in_(elective_group_ids)).all()
+    } if elective_group_ids else {}
     section_ids = {s.section_id for s in sessions}
     sections = {sec.id: sec for sec in db.query(Section).filter(Section.id.in_(section_ids)).all()} if section_ids else {}
     teacher_ids = {s.teacher_id for s in sessions}
@@ -159,7 +164,10 @@ def _assignments_for_schedule(db: Session, schedule: GeneratedSchedule) -> Tuple
         faculty_type = (tch.faculty_type.value if tch and hasattr(tch.faculty_type, "value") else getattr(tch, "faculty_type", "regular")) if tch else "regular"
         room_type = (room.room_type.value if room and hasattr(room.room_type, "value") else getattr(room, "room_type", "lecture")) if room else "lecture"
         room_capacity = room.capacity if room else 0
+        room_number = room.room_number if room else ""
         section_strength = sec.strength if sec else 0
+        elective_group_id = course.program_elective_group_id if course else None
+        elective_group = elective_groups.get(elective_group_id)
         assignments.append(ScheduleAssignment(
             session_id=str(s.id),
             course_id=s.course_id,
@@ -176,6 +184,11 @@ def _assignments_for_schedule(db: Session, schedule: GeneratedSchedule) -> Tuple
             required_room_type=str(required_room_type),
             faculty_type=str(faculty_type),
             link_group_id=getattr(course, "link_group", None) if course else None,
+            shared_room_group_id=f"PE:{elective_group_id}:{day_val}:{slot_index}" if elective_group_id is not None else None,
+            required_capacity=max(int(section_strength or 0), int(elective_group.student_count if elective_group else 0)),
+            program_elective_group_id=elective_group_id,
+            program_elective_student_count=int(elective_group.student_count if elective_group else 0),
+            room_number=str(room_number or ""),
         ))
         session_map[s.id] = s
     return assignments, session_map
@@ -232,12 +245,28 @@ def preview_move(
     # Linked groups: if this course has a link_group, moving one instance should move its whole bundle
     # (e.g. elective cluster). For a preview we validate the full mutated schedule.
     link_group = getattr(course, "link_group", None)
+    elective_group_id = getattr(course, "program_elective_group_id", None)
     section_id = target_session.section_id
     # Find sibling session ids that share (section_id, link_group) and same weekly occurrence number?
     # Simplest: if link_group is set, treat the bundle as all sessions in this schedule with same link_group and section_id
     # that currently share the same (day, slot_index). Move them together.
     bundle_ids = [session_id]
-    if link_group:
+    if elective_group_id is not None:
+        cur_day = target_session.day.value if hasattr(target_session.day, "value") else target_session.day
+        cur_ts = db.query(Timeslot).get(target_session.timeslot_id)
+        cur_slot = cur_ts.slot_index if cur_ts else None
+        group_course_ids = {
+            row.id for row in db.query(Course.id).filter(Course.program_elective_group_id == elective_group_id).all()
+        }
+        bundle_ids = []
+        for sibling in session_map.values():
+            sibling_day = sibling.day.value if hasattr(sibling.day, "value") else sibling.day
+            sibling_ts = db.query(Timeslot).get(sibling.timeslot_id)
+            if sibling.course_id in group_course_ids and sibling_day == cur_day and sibling_ts and sibling_ts.slot_index == cur_slot:
+                bundle_ids.append(sibling.id)
+        if not bundle_ids:
+            bundle_ids = [session_id]
+    elif link_group:
         cur_day = target_session.day.value if hasattr(target_session.day, "value") else target_session.day
         cur_ts = db.query(Timeslot).get(target_session.timeslot_id)
         cur_slot = cur_ts.slot_index if cur_ts else None
@@ -265,11 +294,11 @@ def preview_move(
             sid = None
         if sid in bundle_set:
             # override day/slot/room
-            # For distinct-room bundles (lab parallel), keep each member's original room unless caller forced one room (then reject)
-            if len(bundle_ids) > 1 and new_room_id is not None:
+            # Program electives share one room; ordinary linked lab bundles keep distinct rooms.
+            is_shared_elective = elective_group_id is not None
+            if len(bundle_ids) > 1 and new_room_id is not None and not is_shared_elective:
                 return {"valid": False, "violations": [{"constraint": "C03", "message": "A linked group needs distinct rooms — move without forcing a single room."}]}
-            # pick room per member
-            member_room_id = new_room_id if (new_room_id is not None and len(bundle_ids) == 1) else a.room_id
+            member_room_id = new_room_id if (new_room_id is not None and (is_shared_elective or len(bundle_ids) == 1)) else a.room_id
             member_room = room_by_id.get(member_room_id, room)
             mutated.append(ScheduleAssignment(
                 session_id=a.session_id,
@@ -287,6 +316,11 @@ def preview_move(
                 required_room_type=a.required_room_type,
                 faculty_type=a.faculty_type,
                 link_group_id=a.link_group_id,
+                shared_room_group_id=(f"PE:{elective_group_id}:{new_day}:{new_slot_index}" if is_shared_elective else a.shared_room_group_id),
+                required_capacity=a.required_capacity,
+                program_elective_group_id=a.program_elective_group_id,
+                program_elective_student_count=a.program_elective_student_count,
+                room_number=str(member_room.room_number if member_room else a.room_number),
             ))
         else:
             mutated.append(a)
@@ -294,7 +328,12 @@ def preview_move(
     violations = validate_schedule(mutated, config)
     # Also surface any early room-type/capacity issues that validate_schedule consolidates into C04/C05/C16
     result_violations = [{"constraint": v.constraint, "message": v.message} for v in violations]
-    return {"valid": len(result_violations) == 0, "violations": result_violations, "bundle_ids": bundle_ids}
+    return {
+        "valid": len(result_violations) == 0,
+        "violations": result_violations,
+        "bundle_ids": bundle_ids,
+        "shared_elective": elective_group_id is not None,
+    }
 
 
 def apply_move(
@@ -304,6 +343,7 @@ def apply_move(
     if not preview["valid"]:
         return preview
     bundle_ids = preview.get("bundle_ids", [session_id])
+    shared_elective = preview.get("shared_elective", False)
     ts = _find_timeslot(db, new_day, new_slot_index)
     if not ts:
         return {"valid": False, "violations": [{"constraint": "C07", "message": f"No Timeslot for {new_day} slot {new_slot_index}. Create it on the Timeslots page first."}]}
@@ -316,7 +356,7 @@ def apply_move(
         sess.timeslot_id = ts.id
         sess.start_time = ts.start_time
         sess.end_time = ts.end_time
-        if new_room_id is not None and len(bundle_ids) == 1:
+        if new_room_id is not None and (len(bundle_ids) == 1 or shared_elective):
             sess.room_id = new_room_id
         # For linked lab bundle each member keeps its own room (already validated distinct)
     db.commit()
@@ -339,7 +379,22 @@ def preview_swap(db: Session, schedule: GeneratedSchedule, a_id: int, b_id: int)
     b_day = b_row.day.value if hasattr(b_row.day, "value") else b_row.day
     a_slot = a_ts.slot_index if a_ts else 0
     b_slot = b_ts.slot_index if b_ts else 0
-    # Swap by rebuilding mutated assignments (keep rooms with their session, not with the slot)
+    def swap_bundle(session_id: int) -> list[int]:
+        target = next((assignment for assignment in assignments if assignment.session_id == str(session_id)), None)
+        if target is None or target.program_elective_group_id is None or not target.shared_room_group_id:
+            return [session_id]
+        return [
+            int(assignment.session_id) for assignment in assignments
+            if assignment.shared_room_group_id == target.shared_room_group_id
+        ]
+
+    a_bundle = swap_bundle(a_id)
+    b_bundle = swap_bundle(b_id)
+    if set(a_bundle) == set(b_bundle):
+        return {"valid": False, "violations": [{"constraint": "PE", "message": "These rows are part of the same program-elective class. Choose a different class to swap with."}]}
+    a_bundle_set = set(a_bundle)
+    b_bundle_set = set(b_bundle)
+    # Swap complete elective classes so their sections remain synchronized.
     mutated: List[ScheduleAssignment] = []
     for ass in assignments:
         try:
@@ -347,33 +402,44 @@ def preview_swap(db: Session, schedule: GeneratedSchedule, a_id: int, b_id: int)
         except ValueError:
             mutated.append(ass)
             continue
-        if sid == a_id:
-            mutated.append(ScheduleAssignment(**{**ass.__dict__, "day": b_day, "slot_index": b_slot}))
-        elif sid == b_id:
-            mutated.append(ScheduleAssignment(**{**ass.__dict__, "day": a_day, "slot_index": a_slot}))
+        if sid in a_bundle_set:
+            shared_id = f"PE:{ass.program_elective_group_id}:{b_day}:{b_slot}" if ass.program_elective_group_id is not None else ass.shared_room_group_id
+            mutated.append(ScheduleAssignment(**{**ass.__dict__, "day": b_day, "slot_index": b_slot, "shared_room_group_id": shared_id}))
+        elif sid in b_bundle_set:
+            shared_id = f"PE:{ass.program_elective_group_id}:{a_day}:{a_slot}" if ass.program_elective_group_id is not None else ass.shared_room_group_id
+            mutated.append(ScheduleAssignment(**{**ass.__dict__, "day": a_day, "slot_index": a_slot, "shared_room_group_id": shared_id}))
         else:
             mutated.append(ass)
     violations = validate_schedule(mutated, config)
     # Duration-fit guard: a 2-period lab swapped onto a slot that overflows the day is caught by C07 but also surface early
-    return {"valid": len(violations) == 0, "violations": [{"constraint": v.constraint, "message": v.message} for v in violations]}
+    return {
+        "valid": len(violations) == 0,
+        "violations": [{"constraint": v.constraint, "message": v.message} for v in violations],
+        "a_bundle_ids": a_bundle,
+        "b_bundle_ids": b_bundle,
+        "a_target": {"day": b_day, "slot_index": b_slot},
+        "b_target": {"day": a_day, "slot_index": a_slot},
+    }
 
 
 def apply_swap(db: Session, schedule: GeneratedSchedule, a_id: int, b_id: int) -> dict:
     preview = preview_swap(db, schedule, a_id, b_id)
     if not preview["valid"]:
         return preview
-    a_row = db.query(TimetableSession).get(a_id)
-    b_row = db.query(TimetableSession).get(b_id)
-    if not a_row or not b_row:
-        return preview
-    # swap timeslot/day/start/end, keep each session's own room (so room moves with class, no double-book surprise)
-    a_day, a_ts_id, a_start, a_end = a_row.day, a_row.timeslot_id, a_row.start_time, a_row.end_time
-    b_day, b_ts_id, b_start, b_end = b_row.day, b_row.timeslot_id, b_row.start_time, b_row.end_time
-    a_row.day, a_row.timeslot_id, a_row.start_time, a_row.end_time = b_day, b_ts_id, b_start, b_end
-    b_row.day, b_row.timeslot_id, b_row.start_time, b_row.end_time = a_day, a_ts_id, a_start, a_end
+    for session_ids, target in ((preview["a_bundle_ids"], preview["a_target"]), (preview["b_bundle_ids"], preview["b_target"])):
+        target_timeslot = _find_timeslot(db, target["day"], target["slot_index"])
+        if not target_timeslot:
+            return {"valid": False, "violations": [{"constraint": "C07", "message": f"No Timeslot for {target['day']} slot {target['slot_index']}."}]}
+        for sid in session_ids:
+            row = db.query(TimetableSession).get(sid)
+            if row:
+                row.day = target["day"]
+                row.timeslot_id = target_timeslot.id
+                row.start_time = target_timeslot.start_time
+                row.end_time = target_timeslot.end_time
     db.commit()
     refresh_vacancy_cache(db, schedule)
-    return {"valid": True, "violations": []}
+    return {"valid": True, "violations": [], "a_bundle_ids": preview["a_bundle_ids"], "b_bundle_ids": preview["b_bundle_ids"]}
 
 
 def refresh_vacancy_cache(db: Session, schedule: GeneratedSchedule) -> None:

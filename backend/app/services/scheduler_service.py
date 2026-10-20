@@ -1,5 +1,7 @@
 """Service layer connecting the CSP solver to the database and API."""
 import logging
+import time as clock
+from collections import defaultdict
 from datetime import datetime, time
 from typing import Optional
 from sqlalchemy.orm import Session
@@ -8,6 +10,7 @@ from app.core.config import settings
 from app.models import (
     Course, Section, Teacher, Room, Timeslot, TeacherAvailability,
     ReservedSlot, GeneratedSchedule, TimetableSession, DayOfWeek,
+    ProgramElective, ProgramElectiveGroup,
 )
 from app.models.timetable import ScheduleStatus
 from app.scheduler.csp_solver import CSPSolver, SolverConfig
@@ -16,10 +19,55 @@ from app.scheduler.session_expander import expand_sessions
 from app.scheduler.domain import RoomInfo
 from app.scheduler.optimizer import compute_soft_score
 from app.services.constraint_profiles import get_current_profile
+from app.services.program_elective_sync import deactivate_legacy_elective_offerings
 from app.vacancy.cache import occupancy_cache
 from app.websocket.manager import ws_manager
 
 logger = logging.getLogger(__name__)
+LARGE_PROGRAM_ELECTIVE_ROOMS = {"DT-301", "DT-701", "DT-702"}
+
+
+def _load_warm_start_slots(db: Session, courses: list, timeslots: list) -> dict:
+    """Return previous valid course placements as optional solver hints."""
+    course_ids = {course.id for course in courses}
+    if not course_ids:
+        return {}
+
+    previous = (
+        db.query(GeneratedSchedule)
+        .filter(GeneratedSchedule.status == ScheduleStatus.VALID)
+        .order_by(GeneratedSchedule.generated_at.desc(), GeneratedSchedule.id.desc())
+        .first()
+    )
+    if previous is None:
+        return {}
+
+    timeslot_by_id = {timeslot.id: timeslot for timeslot in timeslots}
+    previous_rows = (
+        db.query(TimetableSession)
+        .filter(
+            TimetableSession.generated_schedule_id == previous.id,
+            TimetableSession.course_id.in_(course_ids),
+        )
+        .all()
+    )
+    occurrences = defaultdict(list)
+    for row in previous_rows:
+        timeslot = timeslot_by_id.get(row.timeslot_id)
+        if timeslot is None:
+            continue
+        day = row.day.value if hasattr(row.day, "value") else row.day
+        occurrences[(row.course_id, row.section_id)].append((day, timeslot.slot_index))
+
+    day_order = {day: index for index, day in enumerate(
+        ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"]
+    )}
+    hints = {}
+    for (course_id, section_id), prior_occurrences in occurrences.items():
+        prior_occurrences.sort(key=lambda item: (day_order.get(item[0], 99), item[1]))
+        for session_number, slot in enumerate(prior_occurrences, start=1):
+            hints[(course_id, section_id, session_number)] = slot
+    return hints
 
 
 def run_scheduler(
@@ -27,6 +75,18 @@ def run_scheduler(
     semester: Optional[int] = None,
 ) -> dict:
     """Load one selected semester (or all), run CSP, and persist results."""
+    # Reconcile older PEI-* imports before loading active courses. Without this
+    # cleanup, the old per-section electives are scheduled independently next
+    # to the coordinator's new shared-group offerings.
+    legacy_electives = deactivate_legacy_elective_offerings(db, semester=semester)
+    if legacy_electives:
+        db.commit()
+        logger.info(
+            "Deactivated %d legacy elective offerings before generation: %s",
+            len(legacy_electives),
+            ", ".join(legacy_electives),
+        )
+
     # Load data
     section_query = db.query(Section).filter(Section.active == True)
     course_query = db.query(Course).filter(Course.active == True)
@@ -45,6 +105,45 @@ def run_scheduler(
         return {"status": "FAILED", "message": "No active courses found"}
     if not rooms_db:
         return {"status": "FAILED", "message": "No active rooms found"}
+
+    active_elective_group_ids = {
+        course.program_elective_group_id for course in courses
+        if course.program_elective_group_id is not None
+    }
+    elective_group_query = (
+        db.query(ProgramElectiveGroup)
+        .join(ProgramElective, ProgramElective.id == ProgramElectiveGroup.program_elective_id)
+        .filter(
+            ProgramElectiveGroup.active.is_(True),
+            ProgramElective.active.is_(True),
+            ProgramElectiveGroup.id.in_(active_elective_group_ids),
+        )
+    )
+    if semester is not None:
+        elective_group_query = elective_group_query.filter(ProgramElective.semester == semester)
+    elective_groups = elective_group_query.all()
+    elective_group_map = {group.id: group for group in elective_groups}
+
+    # Elective enrollment selects a room pool, not just a minimum capacity:
+    # large cohorts must use a named auditorium, smaller cohorts use another
+    # active lecture room so the large rooms remain available for larger classes.
+    for group in elective_groups:
+        is_large = group.student_count > 70
+        allowed_rooms = [
+            room for room in rooms_db
+            if room.room_type.value == "lecture"
+            and room.capacity >= group.student_count
+            and (((room.room_number or "").replace(" ", "").upper() in LARGE_PROGRAM_ELECTIVE_ROOMS) == is_large)
+        ]
+        if not allowed_rooms:
+            cohort = "DT-301, DT-701, or DT-702" if is_large else "a standard lecture room other than DT-301, DT-701, and DT-702"
+            return {
+                "status": "FAILED",
+                "message": (
+                    f"{group.elective.course_code} group {group.group_name} has {group.student_count} students, "
+                    f"but no active {cohort} has sufficient capacity. Update the room inventory before generating."
+                ),
+            }
 
     scope_label = f"Semester {semester}" if semester is not None else "the full department"
     # Scheduling is valid only when every CSE section in the selected scope
@@ -96,6 +195,11 @@ def run_scheduler(
             "faculty_type": tch.faculty_type.value if tch and hasattr(tch.faculty_type, 'value') else "regular",
             "priority": c.priority,
             "link_group": c.link_group,
+            "program_elective_group_id": c.program_elective_group_id,
+            "program_elective_student_count": (
+                elective_group_map[c.program_elective_group_id].student_count
+                if c.program_elective_group_id in elective_group_map else 0
+            ),
         })
 
     sessions = expand_sessions(enriched)
@@ -195,11 +299,17 @@ def run_scheduler(
     section_period_demand = {}
     section_lecture_demand = {}
     teacher_period_demand = {}
+    counted_elective_teacher_groups = set()
     for course in enriched:
         periods = course["weekly_sessions"] * course["duration"]
         section_period_demand[course["section_id"]] = section_period_demand.get(course["section_id"], 0) + periods
         if course["course_type"] == "lecture":
             section_lecture_demand[course["section_id"]] = section_lecture_demand.get(course["section_id"], 0) + periods
+        elective_group_id = course.get("program_elective_group_id")
+        if elective_group_id is not None:
+            if elective_group_id in counted_elective_teacher_groups:
+                continue
+            counted_elective_teacher_groups.add(elective_group_id)
         teacher_period_demand[course["teacher_id"]] = teacher_period_demand.get(course["teacher_id"], 0) + periods
 
     capacity_issues = []
@@ -306,6 +416,7 @@ def run_scheduler(
         "PREFER_BALANCED_DAYS": enable_optimization,
         "expected_sessions_per_course": expected_per_course,
         "valid_room_ids": valid_room_ids,
+        "warm_start_slots": _load_warm_start_slots(db, courses, timeslots),
     }
 
     solver_config = SolverConfig(
@@ -317,8 +428,9 @@ def run_scheduler(
         constraint_config=constraint_config,
     )
 
-    # CP-SAT is the primary solver. The CSP's constructive search remains a
-    # fallback for an unavailable solver or a model/data edge case.
+    # CP-SAT is the primary solver. If needed, CSP gets only the time left from
+    # the same coordinator-configured deadline rather than a second full timeout.
+    solver_started = clock.monotonic()
     result = CPSATSolver(solver_config).solve(sessions, room_infos)
     if result.status != "VALID":
         logger.warning(
@@ -326,9 +438,34 @@ def run_scheduler(
             scope_label,
             result.status,
         )
-        fallback = CSPSolver(solver_config).solve(sessions, room_infos)
-        if fallback.status == "VALID":
-            result = fallback
+        remaining_seconds = timeout - (clock.monotonic() - solver_started)
+        if remaining_seconds > 0.05:
+            fallback_config = SolverConfig(
+                timeout_seconds=remaining_seconds,
+                max_restarts=settings.SCHEDULER_MAX_RESTARTS,
+                debug=settings.SCHEDULER_DEBUG,
+                days=days,
+                slots_per_day=slots_per_day,
+                constraint_config=constraint_config,
+            )
+            fallback = CSPSolver(fallback_config).solve(sessions, room_infos)
+            if fallback.status == "VALID":
+                fallback.generation_time_ms = int((clock.monotonic() - solver_started) * 1000)
+                result = fallback
+            else:
+                result.status = (
+                    "TIMEOUT"
+                    if "TIMEOUT" in {result.status, fallback.status}
+                    else fallback.status
+                )
+                result.generation_time_ms = int((clock.monotonic() - solver_started) * 1000)
+                result.backtracks += fallback.backtracks
+                result.restarts = fallback.restarts
+                result.bottlenecks = list(dict.fromkeys(
+                    [*result.bottlenecks, *fallback.bottlenecks]
+                ))[:8]
+        else:
+            result.generation_time_ms = int((clock.monotonic() - solver_started) * 1000)
 
     # Compute soft score
     soft_score = 0.0

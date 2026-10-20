@@ -11,6 +11,7 @@ import TimetablePage from './pages/TimetablePage';
 import VacancyPage from './pages/VacancyPage';
 import LoginPage from './pages/LoginPage';
 import ConstraintsPage from './pages/ConstraintsPage';
+import ProgramElectivesPage from './pages/ProgramElectivesPage';
 
 export default function App() {
   return (
@@ -22,6 +23,7 @@ export default function App() {
           <Route path="teachers" element={<TeachersPage />} />
           <Route path="sections" element={<SectionsPage />} />
           <Route path="courses" element={<CoursesPage />} />
+          <Route path="program-electives" element={<ProgramElectivesPage />} />
           <Route path="rooms" element={<RoomsPage />} />
           <Route path="timeslots" element={<TimeslotsPage />} />
           <Route path="constraints" element={<ConstraintsPage />} />
