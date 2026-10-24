@@ -1,6 +1,16 @@
 from typing import List
-from collections import defaultdict
 from .base import Constraint, ConstraintResult, ScheduleAssignment
+from app.scheduler.batches import assignment_batch_keys
+
+
+def _longest_run(occupied: set[int]) -> int:
+    longest = run = 0
+    previous = None
+    for slot in sorted(occupied):
+        run = run + 1 if previous is not None and slot == previous + 1 else 1
+        longest = max(longest, run)
+        previous = slot
+    return longest
 
 
 class ConsecutivePeriodsConstraint(Constraint):
@@ -9,53 +19,31 @@ class ConsecutivePeriodsConstraint(Constraint):
 
     def check(self, candidate: ScheduleAssignment, existing: List[ScheduleAssignment], config: dict) -> ConstraintResult:
         limit = config.get("MAX_CONSECUTIVE_PERIODS", 2)
-        section_day = [
-            a for a in existing
-            if a.section_id == candidate.section_id and a.day == candidate.day
-        ]
-        occupied = set()
-        for a in section_day:
-            for s in range(a.slot_index, a.slot_index + a.duration):
-                occupied.add(s)
-        for s in range(candidate.slot_index, candidate.slot_index + candidate.duration):
-            occupied.add(s)
-
-        if not occupied:
-            return ConstraintResult(valid=True, constraint=self.code)
-
-        sorted_slots = sorted(occupied)
-        run = 1
-        for i in range(1, len(sorted_slots)):
-            if sorted_slots[i] == sorted_slots[i - 1] + 1:
-                run += 1
-                if run > limit:
-                    return ConstraintResult(
-                        valid=False, constraint=self.code,
-                        message=f"Section {candidate.section_id} would have {run} consecutive periods on {candidate.day}",
-                    )
-            else:
-                run = 1
+        candidate_slots = set(range(candidate.slot_index, candidate.slot_index + candidate.duration))
+        for key in assignment_batch_keys(candidate):
+            occupied = {
+                slot for assignment in existing
+                if key in assignment_batch_keys(assignment) and assignment.day == candidate.day
+                for slot in range(assignment.slot_index, assignment.slot_index + assignment.duration)
+            } | candidate_slots
+            run = _longest_run(occupied)
+            if run > limit:
+                return ConstraintResult(valid=False, constraint=self.code,
+                    message=f"Section {candidate.section_id} would have {run} consecutive periods on {candidate.day}")
         return ConstraintResult(valid=True, constraint=self.code)
 
     def validate_full(self, assignments: List[ScheduleAssignment], config: dict) -> List[ConstraintResult]:
         limit = config.get("MAX_CONSECUTIVE_PERIODS", 2)
-        by_section_day: dict = defaultdict(set)
+        by_section_day: dict = {}
         for a in assignments:
-            for s in range(a.slot_index, a.slot_index + a.duration):
-                by_section_day[(a.section_id, a.day)].add(s)
+            for key in assignment_batch_keys(a):
+                by_section_day.setdefault((*key, a.day), set()).update(
+                    range(a.slot_index, a.slot_index + a.duration)
+                )
         results = []
-        for (sid, day), slots in by_section_day.items():
-            sorted_slots = sorted(slots)
-            run = 1
-            for i in range(1, len(sorted_slots)):
-                if sorted_slots[i] == sorted_slots[i - 1] + 1:
-                    run += 1
-                    if run > limit:
-                        results.append(ConstraintResult(
-                            valid=False, constraint=self.code,
-                            message=f"Section {sid} has {run} consecutive periods on {day}",
-                        ))
-                        break
-                else:
-                    run = 1
+        for (sid, _batch, day), slots in by_section_day.items():
+            run = _longest_run(slots)
+            if run > limit:
+                results.append(ConstraintResult(valid=False, constraint=self.code,
+                    message=f"Section {sid} has {run} consecutive periods on {day}"))
         return results

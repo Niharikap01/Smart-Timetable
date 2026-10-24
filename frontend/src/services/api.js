@@ -26,6 +26,7 @@ api.interceptors.response.use(
 export const login = (username, password) =>
   api.post('/api/auth/login', new URLSearchParams({ username, password }));
 export const register = (data) => api.post('/api/auth/register', data);
+export const getCurrentUser = () => api.get('/api/auth/me');
 export const getConstraintConfig = () => api.get('/api/constraints/config');
 export const updateConstraintConfig = (data) => api.put('/api/constraints/config', data);
 
@@ -43,11 +44,18 @@ export const importRecords = (entity, file) => {
   return api.post(`/api/import/${entity}`, data);
 };
 
+export const importBatchFacultyWorkbook = (file) => {
+  const data = new FormData();
+  data.append('file', file);
+  return api.post('/api/import/batch-faculty-workbook', data);
+};
+
 export const estimateSectionStrengths = () => api.post('/api/import/estimate-section-strengths');
 
 // Program electives are stored by semester with their joint-section groups.
 export const getProgramElectives = (semester) => api.get('/api/program-electives', { params: { semester } });
 export const createProgramElective = (data) => api.post('/api/program-electives', data);
+export const updateProgramElective = (id, data) => api.put(`/api/program-electives/${id}`, data);
 export const deleteProgramElective = (id) => api.delete(`/api/program-electives/${id}`);
 
 // Sections

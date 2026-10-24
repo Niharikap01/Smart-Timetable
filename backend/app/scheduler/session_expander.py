@@ -2,6 +2,7 @@
 from collections import defaultdict
 from typing import Dict, List
 from app.scheduler.domain import SchedulingSession
+from app.scheduler.batches import normalize_batch_label, teacher_ids
 
 
 def expand_sessions(courses: list) -> List[SchedulingSession]:
@@ -28,6 +29,9 @@ def expand_sessions(courses: list) -> List[SchedulingSession]:
             link_group = c.get("link_group")
             elective_group_id = c.get("program_elective_group_id")
             elective_student_count = c.get("program_elective_student_count", 0)
+            batch_label = c.get("batch_label")
+            all_teacher_ids = teacher_ids(tid, c.get("teacher_ids"))
+            teacher_faculty_types = c.get("teacher_faculty_types", {})
         else:
             cid = c.id
             code = getattr(c, "course_code", "")
@@ -46,6 +50,9 @@ def expand_sessions(courses: list) -> List[SchedulingSession]:
             link_group = getattr(c, "link_group", None)
             elective_group_id = getattr(c, "program_elective_group_id", None)
             elective_student_count = getattr(c, "program_elective_student_count", 0)
+            batch_label = getattr(c, "batch_label", None)
+            all_teacher_ids = teacher_ids(tid, getattr(c, "teacher_ids", None))
+            teacher_faculty_types = getattr(c, "teacher_faculty_types", {})
 
         for sn in range(1, weekly + 1):
             # Instance sn of a grouped course is tied to instance sn of every
@@ -60,7 +67,11 @@ def expand_sessions(courses: list) -> List[SchedulingSession]:
                 shared_room_group_id = None
 
             sessions.append(SchedulingSession(
-                session_id=f"{code}-{ctype}-S{sec_id}-{sn}",
+                session_id=(
+                    f"{code}-{ctype}-S{sec_id}-{normalize_batch_label(batch_label).replace('/', '')}-{sn}"
+                    if normalize_batch_label(batch_label)
+                    else f"{code}-{ctype}-S{sec_id}-{sn}"
+                ),
                 course_id=cid,
                 section_id=sec_id,
                 teacher_id=tid,
@@ -77,6 +88,9 @@ def expand_sessions(courses: list) -> List[SchedulingSession]:
                 program_elective_group_id=elective_group_id,
                 program_elective_student_count=elective_student_count,
                 shared_room_group_id=shared_room_group_id,
+                batch_label=batch_label,
+                teacher_ids=all_teacher_ids,
+                teacher_faculty_types={int(k): v for k, v in teacher_faculty_types.items()},
             ))
     return sessions
 

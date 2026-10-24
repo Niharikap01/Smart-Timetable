@@ -1,5 +1,5 @@
 from fastapi import APIRouter, Depends, HTTPException
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, joinedload
 from typing import List, Optional
 from pydantic import BaseModel
 from app.database.session import get_db
@@ -18,6 +18,7 @@ class PreviewMoveRequest(BaseModel):
     day: str
     slot_index: int
     room_id: Optional[int] = None
+    teacher_id: Optional[int] = None
 
 
 class ApplyMoveRequest(BaseModel):
@@ -25,6 +26,7 @@ class ApplyMoveRequest(BaseModel):
     day: str
     slot_index: int
     room_id: Optional[int] = None
+    teacher_id: Optional[int] = None
 
 
 class PreviewSwapRequest(BaseModel):
@@ -63,7 +65,8 @@ def generate_timetable(req: GenerateRequest, db: Session = Depends(get_db)):
 @router.get("/section/{section_id}", response_model=List[TimetableSessionResponse])
 def get_section_timetable(section_id: int, db: Session = Depends(get_db)):
     latest = db.query(GeneratedSchedule).filter(
-        GeneratedSchedule.status == "VALID"
+        GeneratedSchedule.status == "VALID",
+        GeneratedSchedule.is_stale.is_(False),
     ).order_by(GeneratedSchedule.generated_at.desc()).first()
     if not latest:
         raise HTTPException(404, "No valid schedule found")
@@ -76,20 +79,22 @@ def get_section_timetable(section_id: int, db: Session = Depends(get_db)):
 @router.get("/teacher/{teacher_id}", response_model=List[TimetableSessionResponse])
 def get_teacher_timetable(teacher_id: int, db: Session = Depends(get_db)):
     latest = db.query(GeneratedSchedule).filter(
-        GeneratedSchedule.status == "VALID"
+        GeneratedSchedule.status == "VALID",
+        GeneratedSchedule.is_stale.is_(False),
     ).order_by(GeneratedSchedule.generated_at.desc()).first()
     if not latest:
         raise HTTPException(404, "No valid schedule found")
-    return db.query(TimetableSession).filter(
+    rows = db.query(TimetableSession).options(joinedload(TimetableSession.course)).filter(
         TimetableSession.generated_schedule_id == latest.id,
-        TimetableSession.teacher_id == teacher_id,
     ).all()
+    return [session for session in rows if teacher_id in session.teacher_ids]
 
 
 @router.get("/room/{room_id}", response_model=List[TimetableSessionResponse])
 def get_room_timetable(room_id: int, db: Session = Depends(get_db)):
     latest = db.query(GeneratedSchedule).filter(
-        GeneratedSchedule.status == "VALID"
+        GeneratedSchedule.status == "VALID",
+        GeneratedSchedule.is_stale.is_(False),
     ).order_by(GeneratedSchedule.generated_at.desc()).first()
     if not latest:
         raise HTTPException(404, "No valid schedule found")
@@ -104,7 +109,8 @@ def get_room_timetable(room_id: int, db: Session = Depends(get_db)):
 @router.get("/latest/id")
 def get_latest_schedule_id(db: Session = Depends(get_db)):
     latest = db.query(GeneratedSchedule).filter(
-        GeneratedSchedule.status == "VALID"
+        GeneratedSchedule.status == "VALID",
+        GeneratedSchedule.is_stale.is_(False),
     ).order_by(GeneratedSchedule.generated_at.desc()).first()
     if not latest:
         raise HTTPException(404, "No valid schedule found")
@@ -117,7 +123,7 @@ def preview_move(req: PreviewMoveRequest, db: Session = Depends(get_db)):
     schedule = latest_valid_schedule(db)
     if not schedule:
         raise HTTPException(404, "No valid schedule to edit")
-    return do_preview(db, schedule, req.session_id, req.day, req.slot_index, req.room_id)
+    return do_preview(db, schedule, req.session_id, req.day, req.slot_index, req.room_id, req.teacher_id)
 
 
 @router.post("/latest/move", dependencies=[Depends(require_coordinator)])
@@ -126,7 +132,7 @@ def apply_move(req: ApplyMoveRequest, db: Session = Depends(get_db)):
     schedule = latest_valid_schedule(db)
     if not schedule:
         raise HTTPException(404, "No valid schedule to edit")
-    result = do_move(db, schedule, req.session_id, req.day, req.slot_index, req.room_id)
+    result = do_move(db, schedule, req.session_id, req.day, req.slot_index, req.room_id, req.teacher_id)
     if not result.get("valid"):
         raise HTTPException(422, detail=result)
     return result

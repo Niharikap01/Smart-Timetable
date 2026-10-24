@@ -1,12 +1,21 @@
 import { useState, useEffect } from 'react';
+import { useSearchParams } from 'react-router-dom';
 import { generateTimetable, getSections, getCourses, getRooms, getTimeslots, getConstraintConfig } from '../services/api';
 
+const SEMESTERS = [1, 2, 3, 4, 5, 6, 7, 8];
+const SEMESTER_ROMAN = { 1: 'I', 2: 'II', 3: 'III', 4: 'IV', 5: 'V', 6: 'VI', 7: 'VII', 8: 'VIII' };
+
 export default function GeneratePage() {
+  const [searchParams] = useSearchParams();
+  const requestedSemester = searchParams.get('semester');
   const [stats, setStats] = useState({});
   const [scopeTotals, setScopeTotals] = useState({ sections: 0, courses: 0 });
   const [timeout, setTimeout_] = useState(30);
   const [optimization, setOptimization] = useState(true);
-  const [semester, setSemester] = useState('5');
+  const [semester, setSemester] = useState(() => {
+    const value = Number(requestedSemester);
+    return SEMESTERS.includes(value) ? String(value) : '5';
+  });
   const [generating, setGenerating] = useState(false);
   const [elapsed, setElapsed] = useState(0);
   const [result, setResult] = useState(null);
@@ -74,7 +83,7 @@ export default function GeneratePage() {
     setGenerating(false);
   };
 
-  const semesterName = { 1: 'I', 2: 'II', 3: 'III', 4: 'IV', 5: 'V', 6: 'VI', 7: 'VII', 8: 'VIII' }[semester];
+  const semesterName = SEMESTER_ROMAN[semester];
 
   return (
     <div>
@@ -109,15 +118,13 @@ export default function GeneratePage() {
         <div className="form-grid">
           <div className="form-group"><label>Scheduling scope</label>
             <select value={semester} onChange={e => setSemester(e.target.value)}>
-              <option value="5">Semester V — ready for mapping review</option>
-              <option value="3">Semester III — ready for mapping review</option>
-              <option value="1">Semester I — coordinator mapping required</option>
-              <option value="7">Semester VII — coordinator mapping required</option>
+              {SEMESTERS.map(value => <option key={value} value={value}>
+                Semester {SEMESTER_ROMAN[value]}{[3, 5].includes(value) ? ' — ready for mapping review' : ' — coordinator mapping required'}
+              </option>)}
               <option value="all">All imported semesters</option>
             </select>
             <span className="form-hint">Start with Semester V or III. Incomplete semesters stay stored but do not block this selected timetable.</span>
           </div>
-          <div className="form-group"><label>Algorithm</label><input value="Google OR-Tools CP-SAT (with CSP fallback)" disabled /></div>
           <div className="form-group"><label>Timeout (seconds)</label><input type="number" value={timeout} onChange={e => setTimeout_(parseInt(e.target.value))} /></div>
           <div className="form-group"><label>Academic balance</label>
             <select value={optimization} onChange={e => setOptimization(e.target.value === 'true')}>
@@ -142,7 +149,6 @@ export default function GeneratePage() {
           <div className="loading">
             <div className="spinner" style={{ marginBottom: '1rem' }} />
             <p>Generating timetable... {elapsed}s elapsed</p>
-            <p style={{ color: 'var(--text-secondary)', fontSize: '0.85rem' }}>Google OR-Tools CP-SAT · CSP Backtracking fallback available</p>
           </div>
         </div>
       )}
@@ -161,7 +167,6 @@ export default function GeneratePage() {
             <div><strong>Sessions:</strong> {result.sessions_scheduled}/{result.sessions_expected}</div>
             <div><strong>Backtracks:</strong> {result.backtracks}</div>
             <div><strong>Restarts:</strong> {result.restarts}</div>
-            <div><strong>Algorithm:</strong> {result.algorithm}</div>
           </div>
           {result.unscheduled_sessions?.length > 0 && (
             <div style={{ marginTop: '1rem' }}>

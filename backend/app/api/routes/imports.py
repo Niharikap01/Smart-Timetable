@@ -8,7 +8,9 @@ from __future__ import annotations
 
 import csv
 import io
+import posixpath
 import re
+import unicodedata
 import zipfile
 from typing import Any, Callable
 from xml.etree import ElementTree as ET
@@ -20,9 +22,10 @@ from sqlalchemy.orm import Session
 from app.database.session import get_db
 from app.core.security import require_coordinator
 from app.models import (
-    Course, Room, Section, Teacher, Timeslot,
+    Course, GeneratedSchedule, Room, Section, Teacher, Timeslot,
 )
 from app.models.course import CourseType, RoomType
+from app.models.timetable import ScheduleStatus
 from app.models.teacher import FacultyType
 from app.models.timeslot import DayOfWeek
 from app.schemas.course import CourseCreate
@@ -30,6 +33,8 @@ from app.schemas.room import RoomCreate
 from app.schemas.section import SectionCreate
 from app.schemas.teacher import TeacherCreate
 from app.schemas.timeslot import TimeslotCreate
+from app.services.teaching_load_import import _xlsx_sheets
+from app.scheduler.batches import normalize_batch_label, teacher_ids as batch_teacher_ids
 
 
 router = APIRouter(prefix="/api/import", tags=["imports"])
@@ -84,7 +89,7 @@ def _first_sheet_path(archive: zipfile.ZipFile) -> str:
     for relation in relations.findall(f"{{{PACKAGE_REL_NS}}}Relationship"):
         if relation.attrib.get("Id") == relationship_id:
             target = relation.attrib.get("Target", "")
-            return target.lstrip("/") if target.startswith("xl/") else f"xl/{target.lstrip('/')}"
+            return target.lstrip("/") if target.startswith("/") else posixpath.normpath(f"xl/{target}")
     raise ValueError("The workbook's first worksheet could not be read")
 
 
@@ -463,3 +468,344 @@ async def import_records(entity: str, file: UploadFile = File(...), db: Session 
         "total": len(records),
         "message": f"{len(records)} {entity} imported: {created} added, {updated} updated.",
     }
+
+
+def _canonical_name(value: str) -> str:
+    normalized = unicodedata.normalize("NFKD", value).encode("ascii", "ignore").decode("ascii")
+    return re.sub(r"[^a-z0-9]+", "", normalized.lower())
+
+
+def _batch_teacher(db: Session, name: str, by_name: dict[str, Teacher]) -> Teacher:
+    key = _canonical_name(name)
+    if key in by_name:
+        return by_name[key]
+
+    slug = re.sub(r"[^a-z0-9]+", "_", key).strip("_")[:32] or "faculty"
+    employee_id = f"BATCH_{slug.upper()}"
+    email = f"{slug}@batch-faculty.local"
+    suffix = 2
+    while db.query(Teacher).filter((Teacher.employee_id == employee_id) | (Teacher.email == email)).first():
+        employee_id = f"BATCH_{slug.upper()}_{suffix}"
+        email = f"{slug}.{suffix}@batch-faculty.local"
+        suffix += 1
+    teacher = Teacher(
+        name=name,
+        employee_id=employee_id,
+        email=email,
+        max_daily_hours=7,
+        faculty_type=FacultyType.REGULAR,
+        active=True,
+    )
+    db.add(teacher)
+    db.flush()
+    by_name[key] = teacher
+    return teacher
+
+
+def _is_generated_batch_link(value: str | None, section_id: int) -> bool:
+    """Recognize importer-created links so re-imports can rematch lab blocks."""
+    if not value:
+        return False
+    return bool(
+        re.fullmatch(rf"BATCH-{section_id}-[0-9a-f]{{12}}", value, flags=re.IGNORECASE)
+        or re.fullmatch(rf"BATCH-AUTO-{section_id}-\d+", value, flags=re.IGNORECASE)
+    )
+
+
+def _link_parallel_batch_labs(offerings_by_section: dict[int, list[Course]]) -> None:
+    """Pair each B1/B2 lab with a feasible B3/B4 lab for concurrent teaching.
+
+    Matching identical subjects first is preferred, but only where the two
+    classes have disjoint instructor sets. A maximum bipartite matching then
+    pairs different lab subjects when faculty assignments require it.
+    """
+    for section_id, offerings in offerings_by_section.items():
+        by_pair: dict[str, list[Course]] = {"B1/B2": [], "B3/B4": []}
+        explicit_groups: dict[str, list[Course]] = {}
+        for course in offerings:
+            pair = normalize_batch_label(course.batch_label)
+            if pair not in by_pair:
+                raise ValueError(
+                    f"{course.course_name} in section {section_id} has an unsupported batch label."
+                )
+            if _is_generated_batch_link(course.link_group, section_id):
+                course.link_group = None
+            if course.link_group:
+                explicit_groups.setdefault(course.link_group, []).append(course)
+            else:
+                by_pair[pair].append(course)
+
+        for group_name, members in explicit_groups.items():
+            group_pairs = [normalize_batch_label(member.batch_label) for member in members]
+            if len(members) != 2 or sorted(group_pairs) != ["B1/B2", "B3/B4"]:
+                raise ValueError(
+                    f"Parallel lab group '{group_name}' in section {section_id} must contain exactly one B1/B2 class and one B3/B4 class."
+                )
+            first, second = members
+            if (first.weekly_sessions, first.duration) != (second.weekly_sessions, second.duration):
+                raise ValueError(
+                    f"Parallel lab group '{group_name}' in section {section_id} has different weekly session counts or durations."
+                )
+            shared = set(batch_teacher_ids(first.teacher_id, first.teacher_ids)) & set(
+                batch_teacher_ids(second.teacher_id, second.teacher_ids)
+            )
+            if shared:
+                raise ValueError(
+                    f"Parallel lab group '{group_name}' in section {section_id} assigns the same faculty to both rooms (faculty IDs: {', '.join(map(str, sorted(shared)))})."
+                )
+
+        left = sorted(by_pair["B1/B2"], key=lambda c: (c.course_code.casefold(), c.id or 0))
+        right = sorted(by_pair["B3/B4"], key=lambda c: (c.course_code.casefold(), c.id or 0))
+        if len(left) != len(right):
+            raise ValueError(
+                f"Section {section_id} has {len(left)} unpaired B1/B2 lab offering(s) and {len(right)} B3/B4 offering(s). Each lab block needs one class from each pair."
+            )
+
+        left_to_right: dict[int, list[int]] = {}
+        for left_index, first in enumerate(left):
+            first_teachers = set(batch_teacher_ids(first.teacher_id, first.teacher_ids))
+            left_to_right[left_index] = [
+                right_index for right_index, second in enumerate(right)
+                if (first.weekly_sessions, first.duration) == (second.weekly_sessions, second.duration)
+                and first_teachers.isdisjoint(batch_teacher_ids(second.teacher_id, second.teacher_ids))
+            ]
+        if any(not compatible for compatible in left_to_right.values()):
+            blocked = [left[index].course_code for index, compatible in left_to_right.items() if not compatible]
+            raise ValueError(
+                f"Section {section_id} cannot synchronize every lab pair without a faculty clash or duration mismatch. Review faculty/course assignments for: {', '.join(blocked)}."
+            )
+
+        # Match the most constrained offering first. Within each candidate
+        # list, prefer the same course code to preserve same-subject pairing
+        # whenever its instructor assignments allow that.
+        left_order = sorted(left_to_right, key=lambda i: (len(left_to_right[i]), left[i].course_code.casefold(), left[i].id or 0))
+        matched_right: dict[int, int] = {}
+
+        def augment(left_index: int, seen: set[int]) -> bool:
+            options = sorted(
+                left_to_right[left_index],
+                key=lambda j: (left[left_index].course_code.casefold() != right[j].course_code.casefold(), right[j].course_code.casefold(), right[j].id or 0),
+            )
+            for right_index in options:
+                if right_index in seen:
+                    continue
+                seen.add(right_index)
+                if right_index not in matched_right or augment(matched_right[right_index], seen):
+                    matched_right[right_index] = left_index
+                    return True
+            return False
+
+        if not all(augment(left_index, set()) for left_index in left_order):
+            raise ValueError(
+                f"Section {section_id} has no complete B1/B2-to-B3/B4 lab pairing that avoids faculty clashes. Correct the workbook faculty assignments before importing."
+            )
+
+        matched_pairs = sorted(
+            ((left[left_index], right[right_index]) for right_index, left_index in matched_right.items()),
+            key=lambda pair: (pair[0].course_code.casefold(), pair[1].course_code.casefold(), pair[0].id or 0),
+        )
+        for pair_number, (first, second) in enumerate(matched_pairs, start=1):
+            link_group = f"BATCH-AUTO-{section_id}-{pair_number}"
+            first.link_group = link_group
+            second.link_group = link_group
+
+
+def _apply_batch_faculty_workbook(filename: str, content: bytes, db: Session):
+    """Validate and apply section/batch lab instructors as one transaction."""
+    if not filename.lower().endswith(".xlsx"):
+        raise HTTPException(422, "Choose the Batch Faculty .xlsx workbook")
+    if not content:
+        raise HTTPException(422, "Choose a workbook that contains batch assignments")
+    if len(content) > MAX_IMPORT_BYTES:
+        raise HTTPException(413, "The workbook is larger than 10 MB")
+
+    try:
+        sheets = _xlsx_sheets(content)
+        source_rows = None
+        columns = None
+        required_headers = {"semester_section", "batch", "lab_course", "faculty"}
+        for sheet_rows in sheets.values():
+            for header_index, (_, header_row) in enumerate(sheet_rows):
+                header_keys = [_header_key(value) for value in header_row]
+                if required_headers.issubset(set(header_keys)):
+                    columns = {key: header_keys.index(key) for key in required_headers}
+                    source_rows = sheet_rows[header_index + 1:]
+                    break
+            if source_rows is not None:
+                break
+        if source_rows is None or columns is None:
+            raise ValueError("Expected columns: Semester-Section, Batch, Lab Course, and Faculty")
+
+        grouped: dict[tuple[str, str], dict[int, set[str]]] = {}
+        display_course_names: dict[tuple[str, str], str] = {}
+        malformed: list[str] = []
+        row_count = 0
+        for row_number, values in source_rows:
+            get_value = lambda key: _text(values[columns[key]]) if columns[key] < len(values) else ""
+            section_label = get_value("semester_section").upper().replace(" ", "")
+            batch_text = get_value("batch").upper().replace(" ", "")
+            course_name = _text(get_value("lab_course"))
+            faculty_name = _text(get_value("faculty"))
+            if not any((section_label, batch_text, course_name, faculty_name)):
+                continue
+            row_count += 1
+            batch_number = int(batch_text[1:]) if re.fullmatch(r"B[1-4]", batch_text) else 0
+            if not section_label or not course_name or not faculty_name or batch_number not in (1, 2, 3, 4):
+                malformed.append(f"Row {row_number}: section, B1–B4, lab course, and faculty are required.")
+                continue
+            group_key = (section_label, _canonical_name(course_name))
+            display_course_names.setdefault(group_key, course_name)
+            group = grouped.setdefault(group_key, {})
+            group.setdefault(batch_number, set()).add(faculty_name)
+        if malformed:
+            raise ValueError("Invalid batch faculty rows: " + " ".join(malformed[:12]))
+        if not grouped:
+            raise ValueError("The workbook has headings but no batch assignments")
+    except ValueError as exc:
+        raise HTTPException(422, {"message": "Batch faculty import rejected. No data was saved.", "errors": [str(exc)]}) from exc
+
+    sections_by_name = {_canonical_name(section.name): section for section in db.query(Section).filter(Section.active.is_(True)).all()}
+    lab_courses_by_section_name: dict[tuple[int, str], list[Course]] = {}
+    for course in db.query(Course).filter(Course.active.is_(True), Course.program_elective_group_id.is_(None)).all():
+        course_type = course.course_type.value if hasattr(course.course_type, "value") else course.course_type
+        if course_type == "lab":
+            lab_courses_by_section_name.setdefault((course.section_id, _canonical_name(course.course_name)), []).append(course)
+
+    faculty_lookup: dict[str, Teacher] = {
+        _canonical_name(teacher.name): teacher for teacher in db.query(Teacher).all()
+    }
+    unresolved: list[str] = []
+    mapped_groups: list[tuple[list[Course], dict[str, list[str]]]] = []
+    mapped_rows = 0
+    for (section_label, course_key), batch_faculty in grouped.items():
+        display_course_name = display_course_names[(section_label, course_key)]
+        section_name = section_label if section_label.startswith("CSE") else f"CSE-{section_label}"
+        section = sections_by_name.get(_canonical_name(section_name))
+        if not section:
+            unresolved.append(f"{section_label} · {display_course_name}: no matching active section {section_name}.")
+            continue
+        courses = lab_courses_by_section_name.get((section.id, course_key), [])
+        if not courses:
+            unresolved.append(f"{section.name} · {display_course_name}: no matching active lab course.")
+            continue
+        course_codes = {course.course_code for course in courses}
+        if len(course_codes) != 1:
+            unresolved.append(f"{section.name} · {display_course_name}: multiple course codes match; resolve the course name first.")
+            continue
+
+        pairs: dict[str, list[str]] = {}
+        for pair_label, batch_numbers in (("B1/B2", (1, 2)), ("B3/B4", (3, 4))):
+            names = [name for batch in batch_numbers for name in sorted(batch_faculty.get(batch, set()))]
+            if names:
+                pairs[pair_label] = names
+        mapped_rows += sum(len(names) for names in batch_faculty.values())
+        mapped_groups.append((courses, pairs))
+
+    created_courses = 0
+    updated_courses = 0
+    initial_teacher_count = db.query(Teacher).count()
+    offerings_by_section: dict[int, list[Course]] = {}
+    try:
+        for courses, pairs in mapped_groups:
+            if not pairs:
+                continue
+            by_pair: dict[str, list[Course]] = {"B1/B2": [], "B3/B4": []}
+            unbatched = []
+            invalid_labels = []
+            for course in courses:
+                pair = normalize_batch_label(course.batch_label)
+                if pair:
+                    by_pair[pair].append(course)
+                elif not course.batch_label:
+                    unbatched.append(course)
+                else:
+                    invalid_labels.append(course.batch_label)
+            if invalid_labels or any(len(rows) > 1 for rows in by_pair.values()) or len(unbatched) > 1:
+                unresolved.append(f"{courses[0].section_id} · {courses[0].course_name}: duplicate or unsupported batch rows need review.")
+                continue
+
+            source = next(iter(by_pair["B1/B2"] or by_pair["B3/B4"] or unbatched), None)
+            if source is None:
+                unresolved.append(f"{courses[0].section_id} · {courses[0].course_name}: no reusable course row.")
+                continue
+            source_link_group = source.link_group
+            if _is_generated_batch_link(source_link_group, source.section_id):
+                source_link_group = None
+            template = {
+                "course_code": source.course_code, "course_name": source.course_name,
+                "course_type": source.course_type, "weekly_sessions": source.weekly_sessions,
+                "duration": source.duration, "section_id": source.section_id,
+                "required_room_type": source.required_room_type, "priority": source.priority,
+                "active": source.active, "link_group": source_link_group,
+            }
+            unused_base = unbatched[0] if unbatched else None
+            for pair_label in ("B1/B2", "B3/B4"):
+                instructor_names = list(dict.fromkeys(pairs.get(pair_label, [])))
+                if not instructor_names:
+                    continue
+                instructor_ids = list(dict.fromkeys(
+                    _batch_teacher(db, name, faculty_lookup).id for name in instructor_names
+                ))
+                existing = by_pair[pair_label]
+                if existing:
+                    target = existing[0]
+                elif unused_base is not None:
+                    target = unused_base
+                    unused_base = None
+                else:
+                    target = Course(
+                        **template,
+                        teacher_id=instructor_ids[0],
+                        teacher_ids=instructor_ids,
+                        batch_label=pair_label,
+                    )
+                    db.add(target)
+                    created_courses += 1
+                target.batch_label = pair_label
+                target.teacher_id = instructor_ids[0]
+                target.teacher_ids = instructor_ids
+                target.link_group = source_link_group
+                offerings_by_section.setdefault(target.section_id, []).append(target)
+                updated_courses += 1
+
+        # Every imported pair is one simultaneous lab block, but the two
+        # rooms may teach different subjects. Match compatible offerings so
+        # no instructor is assigned to both rooms at once. Explicit
+        # coordinator link groups are preserved and validated by the helper.
+        _link_parallel_batch_labs(offerings_by_section)
+
+        if updated_courses:
+            db.query(GeneratedSchedule).filter(
+                GeneratedSchedule.status == ScheduleStatus.VALID,
+                GeneratedSchedule.is_stale.is_(False),
+            ).update({GeneratedSchedule.is_stale: True}, synchronize_session=False)
+        db.commit()
+        created_teachers = db.query(Teacher).count() - initial_teacher_count
+        if updated_courses:
+            from app.vacancy.cache import occupancy_cache
+            occupancy_cache.load_schedule([])
+            occupancy_cache.update_current()
+    except Exception as exc:
+        db.rollback()
+        raise HTTPException(422, {"message": "Batch faculty import could not be saved. No course data was changed.", "errors": [str(exc)]}) from exc
+
+    return {
+        "source_rows": row_count,
+        "mapped_faculty_rows": mapped_rows,
+        "faculty_created": created_teachers,
+        "courses_created": created_courses,
+        "batch_offerings_updated": updated_courses,
+        "unresolved": unresolved[:40],
+        "message": (
+            f"Imported {updated_courses} batch lab offering(s) and paired B1/B2 with B3/B4 classes into simultaneous lab blocks without faculty clashes. Generate a new timetable to apply the changes."
+            if updated_courses else "No matching lab courses were changed. Review the unresolved workbook rows."
+        ),
+    }
+
+
+@router.post("/batch-faculty-workbook", dependencies=[Depends(require_coordinator)])
+async def import_batch_faculty_workbook(file: UploadFile = File(...), db: Session = Depends(get_db)):
+    """Apply section/batch lab instructor assignments from the college workbook."""
+    filename = file.filename or "batch-faculty.xlsx"
+    content = await file.read(MAX_IMPORT_BYTES + 1)
+    return _apply_batch_faculty_workbook(filename, content, db)

@@ -17,6 +17,7 @@ from app.scheduler.csp_solver import CSPSolver, SolverConfig
 from app.scheduler.cp_sat_solver import CPSATSolver
 from app.scheduler.session_expander import expand_sessions
 from app.scheduler.domain import RoomInfo
+from app.scheduler.batches import batch_indices, teacher_ids
 from app.scheduler.optimizer import compute_soft_score
 from app.services.constraint_profiles import get_current_profile
 from app.services.program_elective_sync import deactivate_legacy_elective_offerings
@@ -35,7 +36,10 @@ def _load_warm_start_slots(db: Session, courses: list, timeslots: list) -> dict:
 
     previous = (
         db.query(GeneratedSchedule)
-        .filter(GeneratedSchedule.status == ScheduleStatus.VALID)
+        .filter(
+            GeneratedSchedule.status == ScheduleStatus.VALID,
+            GeneratedSchedule.is_stale.is_(False),
+        )
         .order_by(GeneratedSchedule.generated_at.desc(), GeneratedSchedule.id.desc())
         .first()
     )
@@ -178,8 +182,10 @@ def run_scheduler(
     enriched = []
     for c in courses:
         sec = section_map.get(c.section_id)
-        tch = teacher_map.get(c.teacher_id)
-        if not sec or not tch:
+        course_teacher_ids = teacher_ids(c.teacher_id, c.teacher_ids)
+        faculty = {teacher_id: teacher_map.get(teacher_id) for teacher_id in course_teacher_ids}
+        tch = faculty.get(c.teacher_id)
+        if not sec or not tch or any(member is None for member in faculty.values()):
             return {"status": "FAILED", "message": f"Course {c.course_code} has a missing section or teacher assignment"}
         enriched.append({
             "id": c.id,
@@ -190,6 +196,13 @@ def run_scheduler(
             "duration": c.duration,
             "section_id": c.section_id,
             "teacher_id": c.teacher_id,
+            "teacher_ids": course_teacher_ids,
+            "teacher_faculty_types": {
+                teacher_id: (
+                    member.faculty_type.value if hasattr(member.faculty_type, "value") else member.faculty_type
+                ) for teacher_id, member in faculty.items()
+            },
+            "batch_label": c.batch_label,
             "required_room_type": c.required_room_type.value if hasattr(c.required_room_type, 'value') else c.required_room_type,
             "section_strength": sec.strength if sec else 0,
             "faculty_type": tch.faculty_type.value if tch and hasattr(tch.faculty_type, 'value') else "regular",
@@ -302,15 +315,19 @@ def run_scheduler(
     counted_elective_teacher_groups = set()
     for course in enriched:
         periods = course["weekly_sessions"] * course["duration"]
-        section_period_demand[course["section_id"]] = section_period_demand.get(course["section_id"], 0) + periods
-        if course["course_type"] == "lecture":
-            section_lecture_demand[course["section_id"]] = section_lecture_demand.get(course["section_id"], 0) + periods
+        for batch in batch_indices(course.get("batch_label")):
+            section_key = (course["section_id"], batch)
+            section_period_demand[section_key] = section_period_demand.get(section_key, 0) + periods
+            if course["course_type"] == "lecture":
+                section_lecture_demand[section_key] = section_lecture_demand.get(section_key, 0) + periods
         elective_group_id = course.get("program_elective_group_id")
-        if elective_group_id is not None:
-            if elective_group_id in counted_elective_teacher_groups:
+        for teacher_id in course["teacher_ids"]:
+            group_teacher_key = (elective_group_id, teacher_id) if elective_group_id is not None else None
+            if group_teacher_key is not None and group_teacher_key in counted_elective_teacher_groups:
                 continue
-            counted_elective_teacher_groups.add(elective_group_id)
-        teacher_period_demand[course["teacher_id"]] = teacher_period_demand.get(course["teacher_id"], 0) + periods
+            if group_teacher_key is not None:
+                counted_elective_teacher_groups.add(group_teacher_key)
+            teacher_period_demand[teacher_id] = teacher_period_demand.get(teacher_id, 0) + periods
 
     capacity_issues = []
     section_daily_limit = constraint_values["MAX_SECTION_DAILY_HOURS"]
@@ -320,7 +337,7 @@ def run_scheduler(
     section_names = {section.id: section.name for section in sections}
     teacher_names = {teacher.id: teacher.name for teacher in teachers}
     section_capacity_groups = {}
-    for section_id, demand in section_period_demand.items():
+    for (section_id, batch), demand in section_period_demand.items():
         # C19 disallows unexplained student gaps, so a section cannot take
         # classes on both sides of a non-break reserved slot. C20 also requires
         # at least one class before the cutoff. Select the most generous
@@ -354,13 +371,13 @@ def run_scheduler(
 
         if demand > week_capacity:
             section_capacity_groups.setdefault((demand, week_capacity), []).append(
-                section_names.get(section_id, f"Section {section_id}")
+                f"{section_names.get(section_id, f'Section {section_id}')} ({'B1/B2' if batch in (1, 2) else 'B3/B4'})"
             )
-        lecture_demand = section_lecture_demand.get(section_id, 0)
+        lecture_demand = section_lecture_demand.get((section_id, batch), 0)
         lecture_capacity = lecture_daily_limit * len(days)
         if lecture_demand > lecture_capacity:
             capacity_issues.append(
-                f"{section_names.get(section_id, f'Section {section_id}')} needs {lecture_demand} lecture periods/week, "
+                f"{section_names.get(section_id, f'Section {section_id}')} ({'B1/B2' if batch in (1, 2) else 'B3/B4'}) needs {lecture_demand} lecture periods/week, "
                 f"but C10 allows at most {lecture_capacity} ({lecture_daily_limit}/day × {len(days)} days)."
             )
     for teacher_id, demand in teacher_period_demand.items():
@@ -394,6 +411,7 @@ def run_scheduler(
         }
 
     constraint_config = {
+        "days": days,
         "reserved_slots": reserved_slots,
         "recess_slots": recess_slots,
         "allowed_break_slots": allowed_break_slots,
@@ -414,7 +432,18 @@ def run_scheduler(
         # optimization control selects a dynamic candidate ranking that spreads
         # a section over the week and then avoids within-day idle gaps.
         "PREFER_BALANCED_DAYS": enable_optimization,
+        # Semester III has paired batch labs. Prefer putting both lab blocks
+        # for a student cohort on fewer days when hard constraints allow it.
+        "PREFER_CLUSTERED_LAB_DAYS": semester == 3,
         "expected_sessions_per_course": expected_per_course,
+        "program_elective_group_sections": {
+            group.id: {section.id for section in group.sections}
+            for group in elective_groups
+        },
+        "program_elective_weekly_sessions": {
+            group.id: group.elective.weekly_sessions
+            for group in elective_groups
+        },
         "valid_room_ids": valid_room_ids,
         "warm_start_slots": _load_warm_start_slots(db, courses, timeslots),
     }
@@ -470,7 +499,7 @@ def run_scheduler(
     # Compute soft score
     soft_score = 0.0
     if result.status == "VALID" and result.assignments:
-        soft_score = compute_soft_score(result.assignments)
+        soft_score = compute_soft_score(result.assignments, config=constraint_config)
 
     # Persist
     schedule = GeneratedSchedule(
@@ -506,12 +535,16 @@ def run_scheduler(
                 day=a.day,
                 start_time=ts.start_time if ts else "09:00",
                 end_time=ts.end_time if ts else "10:00",
-                session_number=1,
+                session_number=a.session_number,
                 generated_schedule_id=schedule.id,
             ))
         db.commit()
     else:
         db.commit()
+
+    if result.status == "VALID":
+        from app.services.timetable_editor import refresh_vacancy_cache
+        refresh_vacancy_cache(db, schedule)
 
     return {
         "status": result.status,

@@ -8,6 +8,7 @@ from typing import List, Dict, Optional, Set, Tuple
 from dataclasses import dataclass, field
 
 from app.scheduler.domain import SchedulingSession, RoomInfo, GroupCandidate
+from app.scheduler.batches import batch_indices, group_capacity, normalize_batch_label, teacher_ids
 from app.scheduler.candidate_generator import generate_unit_candidates
 from app.scheduler.bitmask import OccupancyTracker
 from app.scheduler.heuristics import DAY_ORDER, select_next_unit, order_group_candidates, unit_key
@@ -45,8 +46,11 @@ class SolverResult:
     bottlenecks: List[str] = field(default_factory=list)
 
 
-def _unit_section_ids(unit: List[SchedulingSession]) -> set[int]:
-    return {member.section_id for member in unit}
+def _unit_section_scopes(unit: List[SchedulingSession]) -> set[tuple[int, str | None]]:
+    return {
+        (member.section_id, member.batch_label if len(batch_indices(member.batch_label)) < 4 else None)
+        for member in unit
+    }
 
 
 def _unit_duration(unit: List[SchedulingSession]) -> int:
@@ -54,7 +58,10 @@ def _unit_duration(unit: List[SchedulingSession]) -> int:
 
 
 def _members_for_bitmask(unit: List[SchedulingSession], candidate: GroupCandidate):
-    return list({(m.teacher_id, candidate.room_assignments[m.session_id].room_id) for m in unit})
+    return list({
+        (teacher_id, candidate.room_assignments[m.session_id].room_id)
+        for m in unit for teacher_id in teacher_ids(m.teacher_id, m.teacher_ids)
+    })
 
 
 def _build_assignments(unit: List[SchedulingSession], candidate: GroupCandidate) -> List[ScheduleAssignment]:
@@ -78,10 +85,14 @@ def _build_assignments(unit: List[SchedulingSession], candidate: GroupCandidate)
             faculty_type=m.faculty_type,
             link_group_id=m.link_group_id,
             shared_room_group_id=m.shared_room_group_id,
-            required_capacity=max(m.section_strength, m.program_elective_student_count),
+            required_capacity=max(group_capacity(m.section_strength, m.batch_label), m.program_elective_student_count),
+            batch_label=m.batch_label,
+            teacher_ids=list(teacher_ids(m.teacher_id, m.teacher_ids)),
+            teacher_faculty_types=m.teacher_faculty_types,
             program_elective_group_id=m.program_elective_group_id,
             program_elective_student_count=m.program_elective_student_count,
             room_number=room.room_number,
+            session_number=m.session_number,
         ))
     return out
 
@@ -120,22 +131,34 @@ class CSPSolver:
 
         units = group_sessions(sessions)
 
-        # A section can occupy at most one scheduling unit at a time. Keep
-        # only enough interchangeable rooms of each type to serve the maximum
-        # possible concurrency in this solve scope. This preserves a complete
-        # room matching while avoiding identical room permutations per slot.
-        section_room_demand: Dict[int, Dict[str, int]] = {}
+        # Keep enough room alternatives for the true maximum concurrency.
+        # Whole-section classes are exclusive with both batch pairs, while
+        # B1/B2 and B3/B4 may each run one class simultaneously in separate
+        # rooms. The old per-section maximum of one undercounted this valid
+        # two-room arrangement and could make CSP report a false failure.
+        section_scope_room_demand: Dict[int, Dict[str | None, Dict[str, int]]] = {}
         for unit in units:
-            per_type: Dict[str, int] = {}
+            per_section_scope: Dict[tuple[int, str | None], Dict[str, int]] = {}
             for member in unit:
+                scope = normalize_batch_label(member.batch_label)
+                key = (member.section_id, scope)
+                per_type = per_section_scope.setdefault(key, {})
                 per_type[member.required_room_type] = per_type.get(member.required_room_type, 0) + 1
-            section_demand = section_room_demand.setdefault(unit[0].section_id, {})
-            for room_type, count in per_type.items():
-                section_demand[room_type] = max(section_demand.get(room_type, 0), count)
+            for (section_id, scope), per_type in per_section_scope.items():
+                scope_demand = section_scope_room_demand.setdefault(section_id, {}).setdefault(scope, {})
+                for room_type, count in per_type.items():
+                    scope_demand[room_type] = max(scope_demand.get(room_type, 0), count)
+
         room_limits: Dict[str, int] = {}
-        for section_demand in section_room_demand.values():
-            for room_type, count in section_demand.items():
-                room_limits[room_type] = room_limits.get(room_type, 0) + count
+        for scope_demands in section_scope_room_demand.values():
+            room_types = {room_type for demand in scope_demands.values() for room_type in demand}
+            for room_type in room_types:
+                full_section = scope_demands.get(None, {}).get(room_type, 0)
+                paired_batches = sum(
+                    scope_demands.get(pair, {}).get(room_type, 0)
+                    for pair in ("B1/B2", "B3/B4")
+                )
+                room_limits[room_type] = room_limits.get(room_type, 0) + max(full_section, paired_batches)
 
         domains: Dict[str, List[GroupCandidate]] = {}
         for unit in units:
@@ -240,7 +263,7 @@ class CSPSolver:
     def _timed_out(self) -> bool:
         return (time.time() - self.start_time) > self.config.timeout_seconds
 
-    def _section_slots_for_day(self, section_id: int, day: str) -> Set[int]:
+    def _section_slots_for_day(self, section_id: int, day: str, batch_label=None) -> Set[int]:
         """Return slots already occupied by a section on one day.
 
         Linked laboratory/elective members intentionally share a section slot;
@@ -249,7 +272,8 @@ class CSPSolver:
         """
         slots: Set[int] = set()
         for assignment in self.assigned:
-            if assignment.section_id == section_id and assignment.day == day:
+            if (assignment.section_id == section_id and assignment.day == day
+                    and set(batch_indices(assignment.batch_label)) & set(batch_indices(batch_label))):
                 slots.update(range(assignment.slot_index, assignment.slot_index + assignment.duration))
         return slots
 
@@ -267,9 +291,12 @@ class CSPSolver:
         long idle gaps.  Faculty load and room capacity are tie-breakers only;
         the conflict constraints remain the authority for validity.
         """
-        section_ids = _unit_section_ids(unit)
+        section_scopes = _unit_section_scopes(unit)
         duration = _unit_duration(unit)
-        slots_by_section = [self._section_slots_for_day(section_id, candidate.day) for section_id in section_ids]
+        slots_by_section = [
+            self._section_slots_for_day(section_id, candidate.day, batch_label)
+            for section_id, batch_label in section_scopes
+        ]
         section_day_load = max((len(slots) for slots in slots_by_section), default=0)
 
         # If the day already has a class, favour adjacency before creating a
@@ -287,12 +314,12 @@ class CSPSolver:
             idle_gap = 0
 
         teacher_day_load = sum({
-            self.occupancy.teacher_load_on_day(member.teacher_id, candidate.day)
-            for member in unit
+            self.occupancy.teacher_load_on_day(teacher_id, candidate.day)
+            for member in unit for teacher_id in teacher_ids(member.teacher_id, member.teacher_ids)
         })
         room_excess = sum({
             candidate.room_assignments[member.session_id].capacity
-            - max(member.section_strength, member.program_elective_student_count)
+            - max(group_capacity(member.section_strength, member.batch_label), member.program_elective_student_count)
             for member in unit
         })
         return (
@@ -321,10 +348,10 @@ class CSPSolver:
         cfg: dict,
     ) -> bool:
         """Check occupancy and every hard rule against the partial schedule."""
-        section_ids = _unit_section_ids(unit)
+        section_scopes = _unit_section_scopes(unit)
         duration = _unit_duration(unit)
         members = _members_for_bitmask(unit, candidate)
-        if self.occupancy.has_unit_conflict(members, section_ids, candidate.day, candidate.slot_index, duration):
+        if self.occupancy.has_unit_conflict(members, section_scopes, candidate.day, candidate.slot_index, duration):
             return False
         check_against = list(self.assigned)
         for assignment in _build_assignments(unit, candidate):
@@ -403,7 +430,7 @@ class CSPSolver:
                 self.assigned.extend(assignments)
                 self.occupancy.assign_unit(
                     _members_for_bitmask(unit, candidate),
-                    _unit_section_ids(unit), candidate.day, candidate.slot_index,
+                    _unit_section_scopes(unit), candidate.day, candidate.slot_index,
                     _unit_duration(unit),
                 )
                 unassigned.remove(unit)
@@ -428,7 +455,7 @@ class CSPSolver:
         key = unit_key(unit)
         remaining = [u for u in unassigned if unit_key(u) != key]
         candidates = self._ordered_candidates(unit, domains.get(key, []))
-        section_ids = _unit_section_ids(unit)
+        section_scopes = _unit_section_scopes(unit)
         duration = _unit_duration(unit)
 
         for candidate in candidates:
@@ -442,7 +469,7 @@ class CSPSolver:
             new_assignments = _build_assignments(unit, candidate)
 
             self.assigned.extend(new_assignments)
-            self.occupancy.assign_unit(members, section_ids, candidate.day, candidate.slot_index, duration)
+            self.occupancy.assign_unit(members, section_scopes, candidate.day, candidate.slot_index, duration)
             self._assigned_units.append((unit, candidate))
 
             saved_domains = {}
@@ -466,7 +493,7 @@ class CSPSolver:
             self.backtracks += 1
             for _ in new_assignments:
                 self.assigned.pop()
-            self.occupancy.unassign_unit(members, section_ids, candidate.day, candidate.slot_index, duration)
+            self.occupancy.unassign_unit(members, section_scopes, candidate.day, candidate.slot_index, duration)
             self._assigned_units.pop()
             for sid, dom in saved_domains.items():
                 domains[sid] = dom
@@ -488,12 +515,12 @@ class CSPSolver:
         workload.  Validate the remaining unit against the partial plan here
         so MRV receives a truthful, much smaller domain.
         """
-        section_ids = _unit_section_ids(unit)
+        section_scopes = _unit_section_scopes(unit)
         duration = _unit_duration(unit)
         pruned = []
         for c in domain:
             members = _members_for_bitmask(unit, c)
-            if self.occupancy.has_unit_conflict(members, section_ids, c.day, c.slot_index, duration):
+            if self.occupancy.has_unit_conflict(members, section_scopes, c.day, c.slot_index, duration):
                 continue
             if not self._candidate_fits_current_plan(unit, c, cfg):
                 continue

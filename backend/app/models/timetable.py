@@ -1,5 +1,5 @@
 from sqlalchemy import (
-    Column, Integer, String, Float, DateTime, ForeignKey,
+    Column, Integer, String, Float, DateTime, ForeignKey, Boolean,
     Enum as SAEnum, Time, JSON,
 )
 from sqlalchemy.orm import relationship
@@ -30,6 +30,7 @@ class GeneratedSchedule(Base):
     restarts = Column(Integer, nullable=True)
     constraint_profile_version = Column(Integer, nullable=True)
     constraint_config_snapshot = Column(JSON, nullable=True)
+    is_stale = Column(Boolean, nullable=False, default=False)
 
     sessions = relationship("TimetableSession", back_populates="schedule")
 
@@ -57,3 +58,21 @@ class TimetableSession(Base):
     room = relationship("Room", back_populates="timetable_sessions")
     timeslot = relationship("Timeslot", back_populates="timetable_sessions")
     schedule = relationship("GeneratedSchedule", back_populates="sessions")
+
+    @property
+    def batch_label(self):
+        return self.course.batch_label if self.course else None
+
+    @property
+    def teacher_ids(self):
+        if not self.course:
+            return [self.teacher_id]
+        # A coordinator may replace the lead teacher on one generated
+        # session without changing the course master record. Preserve the
+        # course's co-instructors but do not resurrect its old lead teacher.
+        course_lead = self.course.teacher_id
+        co_teachers = [
+            teacher_id for teacher_id in (self.course.teacher_ids or [course_lead])
+            if teacher_id != course_lead
+        ]
+        return list(dict.fromkeys([self.teacher_id, *co_teachers]))

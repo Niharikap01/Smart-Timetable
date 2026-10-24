@@ -1,5 +1,5 @@
 import { useState } from 'react';
-import { useNavigate } from 'react-router-dom';
+import { useLocation, useNavigate } from 'react-router-dom';
 import { login } from '../services/api';
 
 export default function LoginPage() {
@@ -7,13 +7,14 @@ export default function LoginPage() {
   const [password, setPassword] = useState('');
   const [error, setError] = useState('');
   const navigate = useNavigate();
+  const location = useLocation();
 
   const handleSubmit = async (e) => {
     e.preventDefault();
     try {
       const res = await login(username, password);
       localStorage.setItem('token', res.data.access_token);
-      navigate('/');
+      navigate(location.state?.from || '/', { replace: true });
     } catch {
       setError('Invalid credentials');
     }

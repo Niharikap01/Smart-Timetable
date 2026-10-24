@@ -1,5 +1,6 @@
 from typing import List
 from .base import Constraint, ConstraintResult, ScheduleAssignment
+from app.scheduler.batches import group_capacity
 
 
 class CapacityConstraint(Constraint):
@@ -18,7 +19,7 @@ class CapacityConstraint(Constraint):
                     valid=False, constraint=self.code,
                     message=f"Program elective enrollment requires {policy}; room {candidate.room_number or candidate.room_id} does not match.",
                 )
-        required_capacity = candidate.required_capacity or candidate.section_strength
+        required_capacity = candidate.required_capacity or group_capacity(candidate.section_strength, candidate.batch_label)
         if candidate.room_capacity < required_capacity:
             return ConstraintResult(
                 valid=False, constraint=self.code,
@@ -30,9 +31,9 @@ class CapacityConstraint(Constraint):
         violations = [
             ConstraintResult(
                 valid=False, constraint=self.code,
-                message=f"Session {a.session_id}: room capacity {a.room_capacity} < required enrollment {a.required_capacity or a.section_strength}",
+                message=f"Session {a.session_id}: room capacity {a.room_capacity} < required enrollment {a.required_capacity or group_capacity(a.section_strength, a.batch_label)}",
             )
-            for a in assignments if a.room_capacity < (a.required_capacity or a.section_strength)
+            for a in assignments if a.room_capacity < (a.required_capacity or group_capacity(a.section_strength, a.batch_label))
         ]
         large_room_names = {"DT-301", "DT-701", "DT-702"}
         for assignment in assignments:

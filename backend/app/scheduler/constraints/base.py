@@ -36,6 +36,10 @@ class ScheduleAssignment:
     program_elective_group_id: Optional[int] = None
     program_elective_student_count: int = 0
     room_number: str = ""
+    session_number: int = 1
+    batch_label: Optional[str] = None
+    teacher_ids: List[int] = field(default_factory=list)
+    teacher_faculty_types: dict[int, str] = field(default_factory=dict)
 
 
 class Constraint(ABC):

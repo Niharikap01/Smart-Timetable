@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useState } from 'react';
-import { Link } from 'react-router-dom';
+import { useLocation, useNavigate } from 'react-router-dom';
 import { getConstraintConfig, updateConstraintConfig } from '../services/api';
 
 const FIELDS = [
@@ -15,6 +15,8 @@ function getErrorMessage(error) {
 }
 
 export default function ConstraintsPage() {
+  const navigate = useNavigate();
+  const location = useLocation();
   const [profile, setProfile] = useState(null);
   const [values, setValues] = useState({});
   const [reason, setReason] = useState('');
@@ -34,16 +36,18 @@ export default function ConstraintsPage() {
       setAccessDenied(false);
     } catch (requestError) {
       const status = requestError.response?.status;
-      setAccessDenied([401, 403].includes(status));
-      setError(status === 401
-        ? 'Sign in with a coordinator account to view and change these settings.'
-        : status === 403
-          ? 'This account does not have coordinator permissions. Ask an administrator to provision a coordinator account.'
-          : 'Could not load the active constraint profile.');
+      if (status === 401) {
+        navigate('/login', { replace: true, state: { from: location } });
+        return;
+      }
+      setAccessDenied(status === 403);
+      setError(status === 403
+        ? 'This account does not have coordinator permissions. Ask an administrator to provision a coordinator account.'
+        : 'Could not load the active constraint profile.');
     } finally {
       setLoading(false);
     }
-  }, []);
+  }, [location, navigate]);
 
   useEffect(() => { load(); }, [load]);
 
@@ -85,8 +89,7 @@ export default function ConstraintsPage() {
       {accessDenied ? (
         <div className="card constraint-note">
           <h2>Coordinator access required</h2>
-          <p>Constraint changes are restricted to coordinator and administrator accounts.</p>
-          <Link className="btn btn-primary" to="/login">Sign in</Link>
+          <p>Constraint changes are restricted to coordinator and administrator accounts. Ask an administrator to grant coordinator access.</p>
         </div>
       ) : loading ? (
         <div className="card">Loading active constraint profile…</div>
@@ -95,7 +98,7 @@ export default function ConstraintsPage() {
           <div className="card constraint-note">
             <h2>Editable scheduling rules</h2>
             <p>Values are applied during solver generation and final validation. Each save creates a version, and generated timetables retain a snapshot of the profile they used.</p>
-            <p><strong>Fixed rules:</strong> room and teacher conflict prevention, room suitability and capacity, required weekly sessions, reserved periods, and faculty availability remain enforced.</p>
+            <p><strong>Fixed rules:</strong> room and teacher conflict prevention, room suitability and capacity, required weekly sessions, reserved periods, faculty availability, and at most one lecture for a course in a section per day remain enforced.</p>
           </div>
 
           <form className="card constraint-form" onSubmit={handleSave}>

@@ -1,6 +1,7 @@
 """Phase 9: Generate candidate (timeslot, room) pairs with pre-filtering."""
 from typing import Dict, List, Optional, Set, Tuple
 from app.scheduler.domain import SchedulingSession, RoomInfo, Candidate, GroupCandidate
+from app.scheduler.batches import group_capacity, teacher_ids
 
 # A college building can contain many interchangeable lecture rooms.  Giving
 # the solver all 90 DT classrooms for every one-hour lecture creates hundreds
@@ -19,7 +20,7 @@ def _best_fitting_rooms(
     matching = [
         room for room in rooms
         if room.room_type == session.required_room_type
-        and room.capacity >= max(session.section_strength, session.program_elective_student_count)
+        and room.capacity >= max(group_capacity(session.section_strength, session.batch_label), session.program_elective_student_count)
     ]
     if session.program_elective_group_id is not None:
         large_rooms = {room for room in LARGE_PROGRAM_ELECTIVE_ROOMS}
@@ -31,7 +32,7 @@ def _best_fitting_rooms(
     limit = (room_limits or {}).get(session.required_room_type, MAX_CANDIDATE_ROOMS_PER_TYPE)
     return sorted(
         matching,
-        key=lambda room: (room.capacity - max(session.section_strength, session.program_elective_student_count), room.room_id),
+        key=lambda room: (room.capacity - max(group_capacity(session.section_strength, session.batch_label), session.program_elective_student_count), room.room_id),
     )[:min(MAX_CANDIDATE_ROOMS_PER_TYPE, max(1, limit))]
 
 
@@ -71,7 +72,7 @@ def generate_candidates(
                 if honours_enabled and (day, s) in honours_slots:
                     blocked = True
                     break
-                if (session.teacher_id, day, s) in teacher_unavailable:
+                if any((teacher_id, day, s) in teacher_unavailable for teacher_id in teacher_ids(session.teacher_id, session.teacher_ids)):
                     blocked = True
                     break
             if blocked:
@@ -100,7 +101,7 @@ def _slot_blocked(
     honours_slots: Set[Tuple[str, int]],
     honours_enabled: bool,
     section_id: int,
-    teacher_id: int,
+    teacher_id: int | tuple[int, ...],
     teacher_unavailable: Set[Tuple[int, str, int]],
 ) -> bool:
     end_slot = start_slot + duration
@@ -113,7 +114,8 @@ def _slot_blocked(
             return True
         if honours_enabled and (day, s) in honours_slots:
             return True
-        if (teacher_id, day, s) in teacher_unavailable:
+        teacher_ids_to_check = teacher_id if isinstance(teacher_id, (tuple, list, set)) else (teacher_id,)
+        if any((faculty_id, day, s) in teacher_unavailable for faculty_id in teacher_ids_to_check):
             return True
     return False
 
@@ -197,6 +199,24 @@ def generate_unit_candidates(
         return []
     duration = durations.pop()
 
+    # A linked lab block still represents separate classes when the members
+    # serve different batch pairs. If one instructor appears on both classes,
+    # the pair cannot legally run in parallel. Program electives are the
+    # exception: their repeated course rows represent one physical shared
+    # class and may legitimately share the same instructor.
+    shared_class_id = unit[0].shared_room_group_id
+    is_one_shared_class = shared_class_id is not None and all(
+        member.shared_room_group_id == shared_class_id for member in unit
+    )
+    if not is_one_shared_class:
+        for index, member in enumerate(unit):
+            member_faculty = set(teacher_ids(member.teacher_id, member.teacher_ids))
+            if any(
+                member_faculty & set(teacher_ids(other.teacher_id, other.teacher_ids))
+                for other in unit[index + 1:]
+            ):
+                return []
+
     shared_room_ids = {member.shared_room_group_id for member in unit}
     shared_room_class = len(shared_room_ids) == 1 and None not in shared_room_ids
 
@@ -208,7 +228,7 @@ def generate_unit_candidates(
             room for room in rooms
             if all(
                 room.room_type == member.required_room_type
-                and room.capacity >= max(member.section_strength, member.program_elective_student_count)
+                and room.capacity >= max(group_capacity(member.section_strength, member.batch_label), member.program_elective_student_count)
                 and ((room.room_number or "").replace(" ", "").upper() in large_rooms)
                 == (member.program_elective_student_count > 70)
                 for member in unit
@@ -218,7 +238,7 @@ def generate_unit_candidates(
         common_rooms = sorted(
             matching_rooms,
             key=lambda room: (
-                room.capacity - max(max(member.section_strength, member.program_elective_student_count) for member in unit),
+                room.capacity - max(max(group_capacity(member.section_strength, member.batch_label), member.program_elective_student_count) for member in unit),
                 room.room_id,
             ),
         )[:min(MAX_CANDIDATE_ROOMS_PER_TYPE, max(1, room_limit))]
@@ -230,7 +250,7 @@ def generate_unit_candidates(
                     _slot_blocked(
                         day, start_slot, duration, slots_per_day,
                         reserved_slots, recess_slots, honours_slots, honours_enabled,
-                        member.section_id, member.teacher_id, teacher_unavailable,
+                        member.section_id, teacher_ids(member.teacher_id, member.teacher_ids), teacher_unavailable,
                     )
                     for member in unit
                 )
@@ -255,7 +275,7 @@ def generate_unit_candidates(
                 _slot_blocked(
                     day, start_slot, duration, slots_per_day,
                     reserved_slots, recess_slots, honours_slots, honours_enabled,
-                    m.section_id, m.teacher_id, teacher_unavailable,
+                    m.section_id, teacher_ids(m.teacher_id, m.teacher_ids), teacher_unavailable,
                 )
                 for m in unit
             )

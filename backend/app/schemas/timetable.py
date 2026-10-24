@@ -17,6 +17,8 @@ class TimetableSessionResponse(BaseModel):
     end_time: time
     session_number: int
     generated_schedule_id: int
+    batch_label: Optional[str] = None
+    teacher_ids: List[int] = Field(default_factory=list)
     model_config = {"from_attributes": True}
 
 
@@ -33,6 +35,7 @@ class GeneratedScheduleResponse(BaseModel):
     restarts: Optional[int]
     constraint_profile_version: Optional[int] = None
     constraint_config_snapshot: Optional[dict] = None
+    is_stale: bool = False
     model_config = {"from_attributes": True}
 
 

@@ -1,13 +1,18 @@
 """Tests for validated master-data spreadsheet/CSV imports."""
 from io import BytesIO
+from types import SimpleNamespace
 from zipfile import ZipFile
 
+import pytest
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 
 from app.database.session import Base
 from app.models import Course, Section, Teacher
-from app.api.routes.imports import _parse_csv, _parse_xlsx, _prepare_rows, _time, _upsert
+from app.api.routes.imports import (
+    _link_parallel_batch_labs, _parse_csv, _parse_xlsx, _prepare_rows, _time, _upsert,
+)
+from app.services.teaching_load_import import _xlsx_sheets
 
 
 def _db_session():
@@ -84,7 +89,7 @@ def test_import_reads_the_first_excel_worksheet():
             </workbook>''')
         archive.writestr("xl/_rels/workbook.xml.rels", '''<?xml version="1.0"?>
             <Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
-              <Relationship Id="rId1" Target="worksheets/sections.xml" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet"/>
+              <Relationship Id="rId1" Target="/xl/worksheets/sections.xml" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet"/>
             </Relationships>''')
         archive.writestr("xl/worksheets/sections.xml", '''<?xml version="1.0"?>
             <worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><sheetData>
@@ -93,7 +98,46 @@ def test_import_reads_the_first_excel_worksheet():
             </sheetData></worksheet>''')
 
     assert _parse_xlsx(workbook.getvalue()) == [(2, {"name": "CSE-5A1", "semester": "5"})]
+    assert _xlsx_sheets(workbook.getvalue())["Sections"] == [
+        (1, ["name", "semester"]),
+        (2, ["CSE-5A1", "5"]),
+    ]
 
 
 def test_import_accepts_excel_serial_time_values():
     assert _time("0.375", "Start time") == "09:00:00"
+
+
+def test_parallel_batch_labs_pair_different_subjects_when_same_subject_faculty_overlap():
+    offerings = [
+        SimpleNamespace(id=1, section_id=5, course_code="LAB-A", batch_label="B1/B2", link_group=None,
+                        weekly_sessions=1, duration=2, teacher_id=1, teacher_ids=[1]),
+        SimpleNamespace(id=2, section_id=5, course_code="LAB-B", batch_label="B1/B2", link_group=None,
+                        weekly_sessions=1, duration=2, teacher_id=2, teacher_ids=[2]),
+        SimpleNamespace(id=3, section_id=5, course_code="LAB-A", batch_label="B3/B4", link_group=None,
+                        weekly_sessions=1, duration=2, teacher_id=1, teacher_ids=[1]),
+        SimpleNamespace(id=4, section_id=5, course_code="LAB-B", batch_label="B3/B4", link_group=None,
+                        weekly_sessions=1, duration=2, teacher_id=2, teacher_ids=[2]),
+    ]
+
+    _link_parallel_batch_labs({5: offerings})
+
+    groups = {}
+    for course in offerings:
+        groups.setdefault(course.link_group, []).append(course)
+    assert len(groups) == 2
+    assert all({course.batch_label for course in group} == {"B1/B2", "B3/B4"} for group in groups.values())
+    assert all(set(group[0].teacher_ids).isdisjoint(group[1].teacher_ids) for group in groups.values())
+    assert all(len({course.course_code for course in group}) == 2 for group in groups.values())
+
+
+def test_parallel_batch_lab_import_rejects_unavoidable_faculty_overlap():
+    offerings = [
+        SimpleNamespace(id=1, section_id=5, course_code="LAB-A", batch_label="B1/B2", link_group=None,
+                        weekly_sessions=1, duration=2, teacher_id=7, teacher_ids=[7]),
+        SimpleNamespace(id=2, section_id=5, course_code="LAB-A", batch_label="B3/B4", link_group=None,
+                        weekly_sessions=1, duration=2, teacher_id=7, teacher_ids=[7]),
+    ]
+
+    with pytest.raises(ValueError, match="faculty clash"):
+        _link_parallel_batch_labs({5: offerings})

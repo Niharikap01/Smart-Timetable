@@ -13,6 +13,7 @@ from collections import defaultdict
 from dataclasses import dataclass, field
 from io import BytesIO
 import math
+import posixpath
 import re
 from typing import Any
 import zipfile
@@ -75,7 +76,7 @@ def _xlsx_sheets(content: bytes) -> dict[str, list[tuple[int, list[str]]]]:
                 name = sheet.attrib.get("name", "")
                 relationship_id = sheet.attrib.get(f"{{{DOC_REL_NS}}}id")
                 target = targets.get(relationship_id, "")
-                path = target.lstrip("/") if target.startswith("xl/") else f"xl/{target.lstrip('/')}"
+                path = target.lstrip("/") if target.startswith("/") else posixpath.normpath(f"xl/{target}")
                 root = ET.fromstring(archive.read(path))
                 rows: list[tuple[int, list[str]]] = []
                 for row in root.findall(f".//{{{XLSX_NS}}}sheetData/{{{XLSX_NS}}}row"):

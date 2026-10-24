@@ -1,5 +1,5 @@
 from pydantic import BaseModel, Field
-from typing import Optional
+from typing import Optional, List
 from app.models.course import CourseType, RoomType
 
 
@@ -19,6 +19,7 @@ class CourseBase(BaseModel):
     # imported reference data preserve that relationship through the API.
     link_group: Optional[str] = Field(None, max_length=50)
     batch_label: Optional[str] = Field(None, max_length=50)
+    teacher_ids: Optional[List[int]] = None
 
 
 class CourseCreate(CourseBase):
@@ -38,6 +39,7 @@ class CourseUpdate(BaseModel):
     active: Optional[bool] = None
     link_group: Optional[str] = Field(None, max_length=50)
     batch_label: Optional[str] = Field(None, max_length=50)
+    teacher_ids: Optional[List[int]] = None
 
 
 class CourseResponse(CourseBase):

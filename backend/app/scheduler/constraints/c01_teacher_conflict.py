@@ -1,5 +1,6 @@
 from typing import List
 from .base import Constraint, ConstraintResult, ScheduleAssignment
+from app.scheduler.batches import teacher_ids
 
 
 class TeacherConflictConstraint(Constraint):
@@ -8,7 +9,7 @@ class TeacherConflictConstraint(Constraint):
 
     def check(self, candidate: ScheduleAssignment, existing: List[ScheduleAssignment], config: dict) -> ConstraintResult:
         for a in existing:
-            if a.teacher_id == candidate.teacher_id and a.day == candidate.day:
+            if set(teacher_ids(a.teacher_id, a.teacher_ids)) & set(teacher_ids(candidate.teacher_id, candidate.teacher_ids)) and a.day == candidate.day:
                 if candidate.shared_room_group_id and a.shared_room_group_id == candidate.shared_room_group_id:
                     continue
                 cand_slots = set(range(candidate.slot_index, candidate.slot_index + candidate.duration))
@@ -24,7 +25,7 @@ class TeacherConflictConstraint(Constraint):
         results = []
         for i, a in enumerate(assignments):
             for b in assignments[i + 1:]:
-                if a.teacher_id == b.teacher_id and a.day == b.day:
+                if set(teacher_ids(a.teacher_id, a.teacher_ids)) & set(teacher_ids(b.teacher_id, b.teacher_ids)) and a.day == b.day:
                     if a.shared_room_group_id and a.shared_room_group_id == b.shared_room_group_id:
                         continue
                     a_slots = set(range(a.slot_index, a.slot_index + a.duration))

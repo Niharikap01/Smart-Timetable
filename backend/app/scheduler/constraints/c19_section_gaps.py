@@ -3,6 +3,7 @@ from collections import defaultdict
 from typing import Iterable, List, Set, Tuple
 
 from .base import Constraint, ConstraintResult, ScheduleAssignment
+from app.scheduler.batches import assignment_batch_keys, batch_indices
 
 
 class SectionGapsConstraint(Constraint):
@@ -16,10 +17,10 @@ class SectionGapsConstraint(Constraint):
     name = "Sections may only have their registered one-period recess"
 
     @staticmethod
-    def _occupied(assignments: Iterable[ScheduleAssignment], section_id: int, day: str) -> Set[int]:
+    def _occupied(assignments: Iterable[ScheduleAssignment], section_id: int, batch: int, day: str) -> Set[int]:
         slots: Set[int] = set()
         for assignment in assignments:
-            if assignment.section_id == section_id and assignment.day == day:
+            if assignment.section_id == section_id and batch in batch_indices(assignment.batch_label) and assignment.day == day:
                 slots.update(range(assignment.slot_index, assignment.slot_index + assignment.duration))
         return slots
 
@@ -42,25 +43,24 @@ class SectionGapsConstraint(Constraint):
 
     def check(self, candidate: ScheduleAssignment, existing: List[ScheduleAssignment], config: dict) -> ConstraintResult:
         allowed_breaks: Set[Tuple[int, str, int]] = config.get("allowed_break_slots", set())
-        occupied = self._occupied([*existing, candidate], candidate.section_id, candidate.day)
-        gap = self._invalid_gap(occupied, candidate.section_id, candidate.day, allowed_breaks)
-        if gap is not None:
-            return ConstraintResult(
-                valid=False,
-                constraint=self.code,
-                message=f"Section {candidate.section_id} would have an unnecessary gap at ({candidate.day}, {gap})",
-            )
+        for _section_id, batch in assignment_batch_keys(candidate):
+            occupied = self._occupied([*existing, candidate], candidate.section_id, batch, candidate.day)
+            gap = self._invalid_gap(occupied, candidate.section_id, candidate.day, allowed_breaks)
+            if gap is not None:
+                return ConstraintResult(valid=False, constraint=self.code,
+                    message=f"Section {candidate.section_id} would have an unnecessary gap at ({candidate.day}, {gap})")
         return ConstraintResult(valid=True, constraint=self.code)
 
     def validate_full(self, assignments: List[ScheduleAssignment], config: dict) -> List[ConstraintResult]:
         allowed_breaks: Set[Tuple[int, str, int]] = config.get("allowed_break_slots", set())
-        per_section_day: dict[tuple[int, str], Set[int]] = defaultdict(set)
+        per_section_day: dict[tuple[int, int, str], Set[int]] = defaultdict(set)
         for assignment in assignments:
-            per_section_day[(assignment.section_id, assignment.day)].update(
-                range(assignment.slot_index, assignment.slot_index + assignment.duration)
-            )
+            for section_id, batch in assignment_batch_keys(assignment):
+                per_section_day[(section_id, batch, assignment.day)].update(
+                    range(assignment.slot_index, assignment.slot_index + assignment.duration)
+                )
         results: List[ConstraintResult] = []
-        for (section_id, day), occupied in per_section_day.items():
+        for (section_id, _batch, day), occupied in per_section_day.items():
             gap = self._invalid_gap(occupied, section_id, day, allowed_breaks)
             if gap is not None:
                 results.append(ConstraintResult(

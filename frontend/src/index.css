@@ -155,6 +155,7 @@ button:focus-visible, input:focus-visible, select:focus-visible, a:focus-visible
 .program-elective-list { display: grid; gap: 14px; }
 .program-elective-card { padding: 0; overflow: hidden; }
 .program-elective-card-header { display: flex; align-items: flex-start; justify-content: space-between; gap: 16px; padding: 19px 21px; }
+.program-elective-actions { display: flex; flex: 0 0 auto; gap: 8px; }
 .program-elective-code { color: var(--blue-700); font-size: 11px; font-weight: 800; letter-spacing: .08em; }
 .program-elective-card h2 { margin: 2px 0 3px; color: var(--navy-950); font-size: 17px; }
 .program-elective-card-header p { margin: 0; color: var(--text-secondary); font-size: 12px; }
@@ -237,6 +238,7 @@ td:last-child { white-space: nowrap; }
 .alert-success { border-color: #aee4d8; background: #ecfaf7; color: #0d615a; }
 .alert-error { border-color: #f0c2bb; background: #fff5f3; color: #8d2018; }
 .alert-info { border-color: #b8d4e9; background: #f0f7fc; color: #245a82; }
+.alert-warning { border-color: #efd9ad; background: #fff9ec; color: #80520d; }
 .constraint-version { border: 1px solid #b8d4e9; border-radius: 999px; background: #f0f7fc; color: #245a82; padding: 6px 11px; font-size: 11px; font-weight: 700; white-space: nowrap; }
 .constraint-note { margin-bottom: 18px; }
 .constraint-note h2 { margin: 0 0 8px; color: var(--navy-950); font-size: 16px; }
@@ -259,9 +261,28 @@ td:last-child { white-space: nowrap; }
 .filters { display: flex; align-items: center; gap: 10px; margin-bottom: 20px; }
 .filters input, .filters select { width: auto; min-width: 180px; }
 .timetable-grid { padding: 0; overflow-x: auto; }
-.timetable-grid table { min-width: 880px; }
+.timetable-grid table { min-width: 1570px; table-layout: fixed; }
 .timetable-grid th { background: var(--navy-900); color: #edf5fa; }
-.timetable-grid td { min-width: 125px; height: 76px; vertical-align: top; }
+.timetable-grid thead th { position: sticky; top: 0; z-index: 2; min-width: 140px; text-align: center; }
+.timetable-grid th.timetable-corner, .timetable-grid th.timetable-day { position: sticky; left: 0; width: 120px; min-width: 120px; max-width: 120px; }
+.timetable-grid th.timetable-corner { z-index: 4; text-align: left; }
+.timetable-grid th.timetable-day { top: auto; z-index: 3; height: 110px; background: var(--navy-900); color: #edf5fa; vertical-align: middle; }
+.timetable-grid td { width: 145px; min-width: 145px; height: 110px; vertical-align: top; }
+.timetable-edit-panel { margin-bottom: 16px; padding: 20px; }
+.timetable-edit-heading, .timetable-edit-selection { display: flex; align-items: flex-start; justify-content: space-between; gap: 18px; }
+.timetable-edit-heading h2 { margin: 2px 0 5px; color: var(--navy-950); font-size: 17px; }
+.timetable-edit-heading p, .timetable-edit-steps p { margin: 0; color: var(--text-secondary); font-size: 12px; line-height: 1.6; }
+.timetable-edit-kicker { display: block; margin-bottom: 4px; color: var(--blue-700); font-size: 10px; font-weight: 800; letter-spacing: .08em; text-transform: uppercase; }
+.timetable-edit-actions, .timetable-edit-selection-actions { display: flex; align-items: center; justify-content: flex-end; flex-wrap: wrap; gap: 8px; }
+.timetable-edit-steps { margin-top: 15px; border-radius: var(--radius-sm); background: #f0f7fc; padding: 11px 13px; }
+.timetable-edit-selection { align-items: center; margin-top: 14px; border: 1px solid var(--border); border-radius: var(--radius-sm); padding: 12px; }
+.timetable-edit-selection > div:first-child { display: grid; gap: 3px; }
+.timetable-edit-selection strong { color: var(--navy-950); font-size: 13px; }
+.timetable-edit-selection > div:first-child > span:last-child { color: var(--text-secondary); font-size: 11px; }
+.timetable-room-select { display: grid; gap: 4px; color: var(--text-secondary); font-size: 10px; font-weight: 700; }
+.timetable-room-select select { min-height: 34px; max-width: 280px; border: 1px solid var(--border-strong); border-radius: var(--radius-sm); background: #fff; color: var(--text); padding: 0 8px; font-size: 11px; }
+.timetable-checking { color: var(--text-secondary); font-size: 12px; }
+.timetable-access-note { display: flex; gap: 5px; align-items: center; }
 .tt-cell { margin-bottom: 4px; border: 1px solid; border-radius: 5px; padding: 7px 8px; font-size: 11px; line-height: 1.4; }
 .tt-cell.lecture { border-color: #c9dcef; background: #eff6fb; }
 .tt-cell.lab { border-color: #b7e0da; background: #edf9f7; }
@@ -270,6 +291,10 @@ td:last-child { white-space: nowrap; }
 .tt-cell .course-name { color: var(--blue-700); font-size: 10px; font-weight: 600; margin: 1px 0 3px; }
 .tt-cell .info { color: var(--text-secondary); font-size: 10px; }
 .tt-cell .duration { color: var(--teal-700); font-weight: 700; margin-top: 2px; }
+.tt-cell-stack { display: grid; grid-template-columns: repeat(auto-fit, minmax(132px, 1fr)); gap: 5px; align-items: stretch; min-height: 100%; }
+.tt-cell-stack > .tt-cell { min-width: 0; margin: 0; }
+.tt-cell .tt-batch-label { display: inline-flex; width: fit-content; margin: 2px 0 3px; border-radius: 999px; padding: 2px 7px; background: #dff5f1; color: #0b5f58; font-size: 9px; font-weight: 800; letter-spacing: .03em; }
+.tt-cell-continuation { opacity: .78; border-style: dashed !important; }
 .tt-reserved { margin-bottom: 4px; border: 1px solid #e4c579; border-radius: 5px; background: #fff7df; color: #755114; padding: 7px 8px; font-size: 11px; line-height: 1.4; }
 .tt-reserved .course { color: #755114; font-weight: 800; letter-spacing: .04em; }
 .tt-reserved .info { color: #87651f; font-size: 10px; }
@@ -294,8 +319,9 @@ td:last-child { white-space: nowrap; }
 .login-card { width: min(420px, 100%); border: 0; padding: 34px; }
 .login-card h2 { color: var(--navy-950); font-family: 'Libre Baskerville', Georgia, serif; }
 
-@media print { .sidebar, .portal-bar, .page-header .btn, .filters { display: none !important; } .main-content { width: 100%; margin-left: 0; padding: 0; } }
+@media print { @page { size: landscape; } .sidebar, .portal-bar, .page-header .btn, .filters, .timetable-edit-panel, .timetable-access-note { display: none !important; } .main-content { width: 100%; margin-left: 0; padding: 0; } .timetable-grid { overflow: visible; } .timetable-grid table { min-width: 0; width: 100%; } .timetable-grid th.timetable-corner, .timetable-grid th.timetable-day, .timetable-grid thead th { position: static; width: auto; min-width: 0; max-width: none; } .timetable-grid td { width: auto; min-width: 0; height: auto; padding: 4px; } }
 @media (max-width: 900px) { .sidebar { width: 84px; } .sidebar-header { justify-content: center; padding: 20px 8px; } .brand-copy, .sidebar-section, .sidebar a .nav-label { display: none; } .sidebar a { justify-content: center; margin: 3px 10px; padding: 0; } .sidebar a.active::before { left: -10px; } .main-content { width: calc(100% - 84px); margin-left: 84px; padding: 0 22px 32px; } .portal-bar { margin: 0 -22px 24px; padding: 0 22px; } }
 @media (max-width: 640px) { .strength-estimate-panel { align-items: stretch; flex-direction: column; } .strength-estimate-panel strong { white-space: normal; } .program-elective-controls { align-items: stretch; flex-direction: column; } .program-elective-card-header { padding: 15px; } .program-elective-group { padding: 12px 15px; } }
 @media (max-width: 640px) { .sidebar { width: 64px; } .sidebar-header { min-height: 72px; padding: 14px 8px; } .brand-mark { width: 34px; height: 34px; font-size: 11px; } .sidebar a { margin: 2px 8px; } .main-content { width: calc(100% - 64px); margin-left: 64px; padding: 0 14px 24px; } .portal-bar { min-height: 62px; margin: 0 -14px 22px; padding: 0 14px; } .portal-label, .portal-status { display: none; } .page-header { align-items: flex-start; flex-direction: column; margin-bottom: 18px; } .page-header h1 { font-size: 22px; } .page-actions, .import-actions { align-items: stretch; flex-direction: column; width: 100%; } .import-panel { width: 100%; } .import-note { text-align: left; } .stats-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px; } .stat-card { min-height: 102px; padding: 15px; } .stat-card .value { font-size: 23px; } .form-grid { grid-template-columns: 1fr; } .filters { align-items: stretch; flex-direction: column; } .filters input, .filters select { width: 100%; } .modal { padding: 20px; } }
 @media (max-width: 640px) { .constraint-fields { grid-template-columns: 1fr; } .constraint-version { align-self: flex-start; } }
+@media (max-width: 760px) { .timetable-edit-heading, .timetable-edit-selection { flex-direction: column; } .timetable-edit-actions, .timetable-edit-selection-actions { justify-content: flex-start; width: 100%; } }

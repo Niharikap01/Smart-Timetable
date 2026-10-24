@@ -78,3 +78,26 @@ def test_cp_sat_respects_section_specific_recess():
         assignment.section_id == 1 and assignment.day == "Monday" and assignment.slot_index == 0
         for assignment in result.assignments
     )
+
+
+def test_cp_sat_balances_periods_across_the_week():
+    """Balanced mode should avoid leaving one cohort with an overloaded day."""
+    days = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"]
+    courses = [
+        {"id": index, "course_code": f"CS{index}", "course_name": f"Course {index}",
+         "course_type": "lecture", "weekly_sessions": 1, "duration": 1,
+         "section_id": 1, "teacher_id": index, "required_room_type": "lecture",
+         "section_strength": 50, "faculty_type": "regular", "priority": 5}
+        for index in range(1, 13)
+    ]
+    config = _config()
+    config.days = days
+    config.constraint_config["expected_sessions_per_course"] = {index: 1 for index in range(1, 13)}
+    result = CPSATSolver(config).solve(
+        expand_sessions(courses),
+        [RoomInfo(room_id=1, room_number="CR-101", room_type="lecture", capacity=60)],
+    )
+
+    assert result.status == "VALID"
+    daily_load = {day: sum(assignment.day == day for assignment in result.assignments) for day in days}
+    assert daily_load == {day: 2 for day in days}

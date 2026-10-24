@@ -17,6 +17,7 @@ from app.scheduler.constraints.c17_teacher_daily_hours import TeacherDailyHoursC
 from app.scheduler.constraints.c18_honours_slot import HonoursSlotConstraint
 from app.scheduler.constraints.c19_section_gaps import SectionGapsConstraint
 from app.scheduler.constraints.c20_section_start_time import SectionStartTimeConstraint
+from app.scheduler.constraints.c21_program_elective_sync import ProgramElectiveSynchronizationConstraint
 from app.scheduler.conflict_checker import check_candidate, validate_schedule, is_candidate_valid
 
 CFG = {"MAX_CONSECUTIVE_PERIODS": 2, "MAX_SECTION_DAILY_HOURS": 6,
@@ -24,12 +25,14 @@ CFG = {"MAX_CONSECUTIVE_PERIODS": 2, "MAX_SECTION_DAILY_HOURS": 6,
 
 
 def _make(sid="s1", cid=1, secid=1, tid=1, rid=1, day="Monday", slot=0, dur=1,
-          rtype="lecture", rcap=60, sstr=50, ctype="lecture", rroom="lecture", ftype="regular"):
+          rtype="lecture", rcap=60, sstr=50, ctype="lecture", rroom="lecture", ftype="regular",
+          pe_group=None, session_number=1):
     return ScheduleAssignment(
         session_id=sid, course_id=cid, section_id=secid, teacher_id=tid,
         room_id=rid, day=day, slot_index=slot, duration=dur,
         room_type=rtype, room_capacity=rcap, section_strength=sstr,
         course_type=ctype, required_room_type=rroom, faculty_type=ftype,
+        program_elective_group_id=pe_group, session_number=session_number,
     )
 
 
@@ -260,6 +263,45 @@ def test_section_may_start_at_noon():
 def test_section_may_not_start_at_one_pm():
     c = SectionStartTimeConstraint()
     assert not c.check(_make(secid=1, slot=4), [], {**CFG, "MAX_SECTION_START_SLOT": 3}).valid
+
+
+# C21 Program elective synchronization
+def test_program_elective_members_must_share_same_placement_and_room():
+    c = ProgramElectiveSynchronizationConstraint()
+    existing = [_make(cid=10, secid=1, tid=5, rid=8, pe_group=3, session_number=1)]
+    matching = _make(sid="s2", cid=11, secid=2, tid=5, rid=8, pe_group=3, session_number=1)
+    mismatch = _make(sid="s3", cid=11, secid=2, tid=5, rid=9, slot=1, pe_group=3, session_number=1)
+    assert c.check(matching, existing, CFG).valid
+    assert not c.check(mismatch, existing, CFG).valid
+
+
+def test_program_elective_full_validation_checks_all_sections_and_occurrences():
+    c = ProgramElectiveSynchronizationConstraint()
+    assignments = [
+        _make(cid=10, secid=1, tid=5, rid=8, pe_group=3, session_number=1),
+        _make(sid="s2", cid=11, secid=2, tid=5, rid=8, pe_group=3, session_number=1),
+    ]
+    config = {
+        **CFG,
+        "program_elective_group_sections": {3: {1, 2}},
+        "program_elective_weekly_sessions": {3: 2},
+    }
+    violations = c.validate_full(assignments, config)
+    assert len(violations) == 2  # the second weekly occurrence is missing for both sections
+
+
+def test_program_elective_validation_ignores_other_semesters():
+    c = ProgramElectiveSynchronizationConstraint()
+    assignments = [
+        _make(cid=10, secid=1, tid=5, rid=8, pe_group=3, session_number=1),
+        _make(sid="s2", cid=11, secid=2, tid=5, rid=8, pe_group=3, session_number=1),
+    ]
+    config = {
+        **CFG,
+        "program_elective_group_sections": {3: {1, 2}, 4: {5, 6}},
+        "program_elective_weekly_sessions": {3: 1, 4: 1},
+    }
+    assert c.validate_full(assignments, config) == []
 
 
 # Full conflict checker

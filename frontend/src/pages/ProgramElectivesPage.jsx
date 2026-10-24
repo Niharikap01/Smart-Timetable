@@ -1,11 +1,11 @@
 import { useEffect, useMemo, useState } from 'react';
 import { Link } from 'react-router-dom';
-import { createProgramElective, deleteProgramElective, getProgramElectives, getSections, getTeachers } from '../services/api';
+import { createProgramElective, updateProgramElective, deleteProgramElective, getProgramElectives, getSections, getTeachers } from '../services/api';
 import Modal from '../components/Modal';
 
 const LARGE_ROOMS = 'DT-301, DT-701, DT-702';
 const newGroup = (index) => ({ group_name: `Group ${index + 1}`, teacher_id: '', student_count: '', section_ids: [] });
-const emptyForm = (semester) => ({ semester: Number(semester), course_code: '', course_name: '', weekly_sessions: 1, duration: 1, groups: [newGroup(0)] });
+const emptyForm = (semester) => ({ semester: Number(semester), course_code: '', course_name: '', periods_per_week: 1, groups: [newGroup(0)] });
 
 function describeError(error) {
   const detail = error.response?.data?.detail;
@@ -22,6 +22,7 @@ export default function ProgramElectivesPage() {
   const [loading, setLoading] = useState(true);
   const [modalOpen, setModalOpen] = useState(false);
   const [form, setForm] = useState(emptyForm('5'));
+  const [editingElectiveId, setEditingElectiveId] = useState(null);
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState('');
   const [notice, setNotice] = useState('');
@@ -75,7 +76,27 @@ export default function ProgramElectivesPage() {
   };
 
   const openCreate = () => {
+    setEditingElectiveId(null);
     setForm(emptyForm(semester));
+    setError('');
+    setNotice('');
+    setModalOpen(true);
+  };
+
+  const openEdit = (elective) => {
+    setEditingElectiveId(elective.id);
+    setForm({
+      semester: Number(elective.semester),
+      course_code: elective.course_code,
+      course_name: elective.course_name,
+      periods_per_week: elective.periods_per_week,
+      groups: elective.groups.map(group => ({
+        group_name: group.group_name,
+        teacher_id: String(group.teacher_id),
+        student_count: String(group.student_count),
+        section_ids: group.section_ids.map(Number),
+      })),
+    });
     setError('');
     setNotice('');
     setModalOpen(true);
@@ -91,19 +112,21 @@ export default function ProgramElectivesPage() {
     }
     setSaving(true);
     try {
-      await createProgramElective({
+      const payload = {
         ...form,
         semester: Number(semester),
-        weekly_sessions: Number(form.weekly_sessions),
-        duration: Number(form.duration),
+        periods_per_week: Number(form.periods_per_week),
         groups: form.groups.map(group => ({
           ...group,
           teacher_id: Number(group.teacher_id),
           student_count: Number(group.student_count),
         })),
-      });
+      };
+      if (editingElectiveId === null) await createProgramElective(payload);
+      else await updateProgramElective(editingElectiveId, payload);
       setModalOpen(false);
-      setNotice(`${form.course_code.toUpperCase()} was saved for Semester ${semester}.`);
+      setEditingElectiveId(null);
+      setNotice(`${form.course_code.toUpperCase()} was ${editingElectiveId === null ? 'added' : 'updated'}. Regenerate Semester ${semester}; its timetable updates after a valid generation.`);
       await load();
     } catch (saveError) {
       const status = saveError.response?.status;
@@ -125,7 +148,7 @@ export default function ProgramElectivesPage() {
     try {
       await deleteProgramElective(elective.id);
       setElectives(current => current.filter(item => item.id !== elective.id));
-      setNotice(`${elective.course_code} was removed from future generation.`);
+      setNotice(`${elective.course_code} was removed. Regenerate Semester ${semester}; its timetable updates after a valid generation.`);
     } catch (removeError) {
       const status = removeError.response?.status;
       setAccessDenied([401, 403].includes(status));
@@ -161,11 +184,11 @@ export default function ProgramElectivesPage() {
             {[1, 2, 3, 4, 5, 6, 7, 8].map(value => <option key={value} value={value}>Semester {value}</option>)}
           </select>
         </div>
-        <p>Electives are stored for the selected semester. Sections grouped under one class receive the same time and room in their individual timetables.</p>
+        <p>Electives are stored for the selected semester. Sections grouped under one class receive the same time and room. Regenerate the semester after adding, editing, or removing an elective; the current timetable changes after a valid generation.</p>
       </div>
 
       {error && !modalOpen && <div className="alert alert-error">{error}</div>}
-      {notice && <div className="alert alert-success">{notice}</div>}
+      {notice && <div className="alert alert-success">{notice} <Link to={`/generate?semester=${semester}`}>Generate updated timetable</Link></div>}
 
       {loading ? <div className="loading"><div className="spinner" /></div> : electives.length === 0 ? (
         <div className="card program-elective-empty">No program electives have been added for Semester {semester}.</div>
@@ -177,9 +200,12 @@ export default function ProgramElectivesPage() {
                 <div>
                   <div className="program-elective-code">{elective.course_code}</div>
                   <h2>{elective.course_name}</h2>
-                  <p>{elective.weekly_sessions} session{elective.weekly_sessions === 1 ? '' : 's'} per week · {elective.duration} period{elective.duration === 1 ? '' : 's'} each</p>
+                  <p>{elective.periods_per_week} period{elective.periods_per_week === 1 ? '' : 's'} per week</p>
                 </div>
-                <button className="btn btn-danger btn-sm" onClick={() => remove(elective)}>Remove</button>
+                <div className="program-elective-actions">
+                  <button className="btn btn-secondary btn-sm" onClick={() => openEdit(elective)}>Edit</button>
+                  <button className="btn btn-danger btn-sm" onClick={() => remove(elective)}>Remove</button>
+                </div>
               </div>
               <div className="program-elective-groups">
                 {elective.groups.map(group => (
@@ -201,14 +227,13 @@ export default function ProgramElectivesPage() {
       )}
 
       {modalOpen && (
-        <Modal title={`Add Program Elective · Semester ${semester}`} onClose={() => !saving && setModalOpen(false)}>
+        <Modal title={`${editingElectiveId === null ? 'Add' : 'Edit'} Program Elective · Semester ${semester}`} onClose={() => !saving && setModalOpen(false)}>
           <form onSubmit={save}>
             {error && <div className="alert alert-error">{error}</div>}
             <div className="form-grid">
               <div className="form-group"><label>Course code</label><input required maxLength="50" value={form.course_code} onChange={event => setForm(current => ({ ...current, course_code: event.target.value }))} /></div>
               <div className="form-group"><label>Course name</label><input required maxLength="200" value={form.course_name} onChange={event => setForm(current => ({ ...current, course_name: event.target.value }))} /></div>
-              <div className="form-group"><label>Sessions per week</label><input type="number" min="1" max="30" required value={form.weekly_sessions} onChange={event => setForm(current => ({ ...current, weekly_sessions: event.target.value }))} /></div>
-              <div className="form-group"><label>Periods per session</label><input type="number" min="1" max="8" required value={form.duration} onChange={event => setForm(current => ({ ...current, duration: event.target.value }))} /></div>
+              <div className="form-group"><label>Periods per week</label><input type="number" min="1" max="30" required value={form.periods_per_week} onChange={event => setForm(current => ({ ...current, periods_per_week: event.target.value }))} /><span className="form-hint">Each period is scheduled as one class hour.</span></div>
             </div>
 
             <div className="program-elective-groups-form-header">
@@ -252,7 +277,7 @@ export default function ProgramElectivesPage() {
 
             <div className="modal-footer">
               <button type="button" className="btn btn-secondary" disabled={saving} onClick={() => setModalOpen(false)}>Cancel</button>
-              <button type="submit" className="btn btn-primary" disabled={saving || sections.length === 0 || teachers.length === 0}>{saving ? 'Saving…' : 'Save program elective'}</button>
+              <button type="submit" className="btn btn-primary" disabled={saving || sections.length === 0 || teachers.length === 0}>{saving ? 'Saving…' : editingElectiveId === null ? 'Save program elective' : 'Save changes'}</button>
             </div>
           </form>
         </Modal>

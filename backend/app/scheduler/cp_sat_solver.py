@@ -18,6 +18,7 @@ from app.scheduler.conflict_checker import validate_schedule
 from app.scheduler.constraints.base import ScheduleAssignment
 from app.scheduler.csp_solver import SolverConfig, SolverResult
 from app.scheduler.domain import GroupCandidate, RoomInfo, SchedulingSession
+from app.scheduler.batches import batch_indices, group_capacity, teacher_ids
 from app.scheduler.session_expander import group_sessions
 
 try:  # Import lazily/defensively so the fallback still works before install.
@@ -112,6 +113,7 @@ class CPSATSolver:
             model.AddExactlyOne(by_unit[unit_index])
 
         self._add_resource_constraints(model, choices)
+        self._add_course_daily_constraints(model, choices)
         self._add_daily_load_constraints(model, choices, cfg)
         section_occupancy = self._section_occupancy(model, choices)
         self._add_compact_day_constraints(model, section_occupancy, cfg)
@@ -223,24 +225,78 @@ class CPSATSolver:
         best_solver = solver
         best_assignments = assignments
 
-        # Hard feasibility comes first. Only spend leftover time on the
-        # optional balance objective after a fully validated timetable exists.
-        self._add_optional_balance_objective(model, choices, cfg, warm_choices.values())
+        # Hard feasibility comes first. Only spend leftover time on optional
+        # quality objectives after a fully validated timetable exists.
         remaining = deadline - time.monotonic()
-        optimization_budget = min(5.0, max(0.0, remaining * 0.25))
-        if cfg.get("PREFER_BALANCED_DAYS", False) and optimization_budget > 0.25:
-            optimizer = self._new_solver(optimization_budget)
-            optimized_status = optimizer.Solve(model)
-            if optimized_status in (cp_model.OPTIMAL, cp_model.FEASIBLE):
-                optimized_choices = [choice for choice in choices if optimizer.Value(choice.variable)]
-                optimized_assignments = [
-                    assignment
-                    for choice in optimized_choices
-                    for assignment in self._build_assignments(choice.unit, choice.candidate)
-                ]
-                if self._allocate_rooms(optimized_assignments, rooms) and not validate_schedule(optimized_assignments, cfg):
-                    best_solver = optimizer
-                    best_assignments = optimized_assignments
+        prefer_lab_compaction = cfg.get("PREFER_CLUSTERED_LAB_DAYS", False)
+        prefer_balance = cfg.get("PREFER_BALANCED_DAYS", False)
+        baseline_day_quality = self._day_distribution_quality(assignments)
+        # Keep a modest lab-compaction pass, then reserve most of the remaining
+        # time for the weekly balance objective.  The previous 80/20 split for
+        # Semester III often left the section-day objective only a few seconds
+        # on a large import, so empty and one-period days survived despite a
+        # valid, otherwise complete timetable.
+        optimization_share = (
+            0.8 if (prefer_lab_compaction and prefer_balance)
+            else 0.75 if prefer_lab_compaction
+            else 0.5
+        )
+        optimization_cap = 60.0 if (prefer_lab_compaction and prefer_balance) else 15.0
+        optimization_budget = min(optimization_cap, max(0.0, remaining * optimization_share))
+        if (prefer_lab_compaction or prefer_balance) and optimization_budget > 0.25:
+            optimization_deadline = time.monotonic() + optimization_budget
+
+            # Optimize the lab-day count in its own CP-SAT pass. Keeping this
+            # lexicographic tier separate avoids multiplying the existing
+            # large balance coefficients into an overflowing int64 objective.
+            if prefer_lab_compaction:
+                lab_day_count = self._lab_day_count_objective(model, choices)
+                if lab_day_count is not None:
+                    lab_budget = optimization_budget
+                    if prefer_balance:
+                        lab_budget = optimization_budget * (0.25 if prefer_lab_compaction else 0.0)
+                    lab_solver = self._new_solver(lab_budget)
+                    model.Minimize(lab_day_count)
+                    lab_status = lab_solver.Solve(model)
+                    if lab_status in (cp_model.OPTIMAL, cp_model.FEASIBLE):
+                        lab_day_limit = lab_solver.Value(lab_day_count)
+                        lab_choices = [choice for choice in choices if lab_solver.Value(choice.variable)]
+                        lab_assignments = [
+                            assignment
+                            for choice in lab_choices
+                            for assignment in self._build_assignments(choice.unit, choice.candidate)
+                        ]
+                        if (
+                            self._allocate_rooms(lab_assignments, rooms)
+                            and not validate_schedule(lab_assignments, cfg)
+                            and self._day_distribution_quality(lab_assignments) >= baseline_day_quality
+                        ):
+                            best_solver = lab_solver
+                            best_assignments = lab_assignments
+                        # A feasible (possibly not proven optimal) lab count
+                        # becomes a safe upper bound for the next soft tier.
+                        model.Add(lab_day_count <= lab_day_limit)
+
+            if prefer_balance:
+                self._add_optional_balance_objective(model, choices, cfg, warm_choices.values())
+                balance_budget = max(0.0, optimization_deadline - time.monotonic())
+                if balance_budget > 0.25:
+                    optimizer = self._new_solver(balance_budget)
+                    optimized_status = optimizer.Solve(model)
+                    if optimized_status in (cp_model.OPTIMAL, cp_model.FEASIBLE):
+                        optimized_choices = [choice for choice in choices if optimizer.Value(choice.variable)]
+                        optimized_assignments = [
+                            assignment
+                            for choice in optimized_choices
+                            for assignment in self._build_assignments(choice.unit, choice.candidate)
+                        ]
+                        if (
+                            self._allocate_rooms(optimized_assignments, rooms)
+                            and not validate_schedule(optimized_assignments, cfg)
+                            and self._day_distribution_quality(optimized_assignments) >= baseline_day_quality
+                        ):
+                            best_solver = optimizer
+                            best_assignments = optimized_assignments
 
         return SolverResult(
             status="VALID",
@@ -335,10 +391,14 @@ class CPSATSolver:
                 faculty_type=member.faculty_type,
                 link_group_id=member.link_group_id,
                 shared_room_group_id=member.shared_room_group_id,
-                required_capacity=max(member.section_strength, member.program_elective_student_count),
+                required_capacity=max(group_capacity(member.section_strength, member.batch_label), member.program_elective_student_count),
+                batch_label=member.batch_label,
+                teacher_ids=list(teacher_ids(member.teacher_id, member.teacher_ids)),
+                teacher_faculty_types=member.teacher_faculty_types,
                 program_elective_group_id=member.program_elective_group_id,
                 program_elective_student_count=member.program_elective_student_count,
                 room_number=room.room_number,
+                session_number=member.session_number,
             ))
         return assignments
 
@@ -351,17 +411,18 @@ class CPSATSolver:
             return True
         preferences = cfg.get("senior_preferred_slots", set())
         for member in unit:
-            if member.faculty_type != "senior":
-                continue
-            teacher_preferences = {
-                (day, slot) for teacher_id, day, slot in preferences
-                if teacher_id == member.teacher_id
-            }
-            if teacher_preferences and any(
-                (candidate.day, slot) not in teacher_preferences
-                for slot in range(candidate.slot_index, candidate.slot_index + member.duration)
-            ):
-                return False
+            for teacher_id in teacher_ids(member.teacher_id, member.teacher_ids):
+                if member.teacher_faculty_types.get(teacher_id, member.faculty_type) != "senior":
+                    continue
+                teacher_preferences = {
+                    (day, slot) for preferred_teacher, day, slot in preferences
+                    if preferred_teacher == teacher_id
+                }
+                if teacher_preferences and any(
+                    (candidate.day, slot) not in teacher_preferences
+                    for slot in range(candidate.slot_index, candidate.slot_index + member.duration)
+                ):
+                    return False
         return True
 
     @staticmethod
@@ -374,6 +435,44 @@ class CPSATSolver:
                 # versions reject duplicates passed to AddAtMostOne.
                 model.Add(sum(variables) <= 1)
 
+    @staticmethod
+    def _add_course_daily_constraints(model, choices: List[_Choice]) -> None:
+        """C22: a lecture course can occur at most once per section-day."""
+        lecture_choices: DefaultDict[tuple, set] = defaultdict(set)
+        for choice in choices:
+            for member in choice.unit:
+                course_type = str(getattr(member.course_type, "value", member.course_type)).lower()
+                if course_type == "lecture":
+                    lecture_choices[(member.course_id, member.section_id, choice.candidate.day)].add(
+                        choice.variable
+                    )
+        for variables in lecture_choices.values():
+            if len(variables) > 1:
+                model.Add(sum(variables) <= 1)
+
+    def _day_distribution_quality(self, assignments: List[ScheduleAssignment]) -> tuple[int, int, int]:
+        """Rank valid solutions by active days, then empty and singleton days."""
+        cohorts = set()
+        occupied = defaultdict(set)
+        for assignment in assignments:
+            for batch in batch_indices(assignment.batch_label):
+                cohort = (assignment.section_id, batch)
+                cohorts.add(cohort)
+                occupied[(assignment.section_id, batch, assignment.day)].update(
+                    range(assignment.slot_index, assignment.slot_index + assignment.duration)
+                )
+
+        loads = [
+            len(occupied.get((section_id, batch, day), ()))
+            for section_id, batch in cohorts
+            for day in self.config.days
+        ]
+        return (
+            sum(load > 0 for load in loads),
+            -sum(load == 0 for load in loads),
+            -sum(load == 1 for load in loads),
+        )
+
     def _add_resource_constraints(self, model, choices: List[_Choice]) -> None:
         """C01/C02: teachers and sections never overlap.
 
@@ -385,10 +484,18 @@ class CPSATSolver:
         section_slots: DefaultDict[tuple, List[object]] = defaultdict(list)
 
         for choice in choices:
-            for section_id in {member.section_id for member in choice.unit}:
+            section_batches = {
+                (member.section_id, batch)
+                for member in choice.unit for batch in batch_indices(member.batch_label)
+            }
+            for section_id, batch in section_batches:
                 for slot in range(choice.candidate.slot_index, choice.candidate.slot_index + choice.unit[0].duration):
-                    section_slots[(section_id, choice.candidate.day, slot)].append(choice.variable)
-            for teacher_id in {member.teacher_id for member in choice.unit}:
+                    section_slots[(section_id, batch, choice.candidate.day, slot)].append(choice.variable)
+            faculty_ids = {
+                teacher_id for member in choice.unit
+                for teacher_id in teacher_ids(member.teacher_id, member.teacher_ids)
+            }
+            for teacher_id in faculty_ids:
                 for slot in range(choice.candidate.slot_index, choice.candidate.slot_index + choice.unit[0].duration):
                     teacher_slots[(teacher_id, choice.candidate.day, slot)].append(choice.variable)
 
@@ -467,15 +574,20 @@ class CPSATSolver:
         teacher_loads: DefaultDict[tuple, List[object]] = defaultdict(list)
 
         for choice in choices:
-            by_section = defaultdict(list)
+            by_section_batch = defaultdict(list)
             for member in choice.unit:
-                by_section[member.section_id].append(member)
-            for section_id, members in by_section.items():
-                key = (section_id, choice.candidate.day)
+                for batch in batch_indices(member.batch_label):
+                    by_section_batch[(member.section_id, batch)].append(member)
+            for (section_id, batch), members in by_section_batch.items():
+                key = (section_id, batch, choice.candidate.day)
                 section_loads[key].append(choice.unit[0].duration * choice.variable)
                 if any(member.course_type == "lecture" for member in members):
                     lecture_loads[key].append(choice.unit[0].duration * choice.variable)
-            for teacher_id in {member.teacher_id for member in choice.unit}:
+            faculty_ids = {
+                teacher_id for member in choice.unit
+                for teacher_id in teacher_ids(member.teacher_id, member.teacher_ids)
+            }
+            for teacher_id in faculty_ids:
                 teacher_loads[(teacher_id, choice.candidate.day)].append(choice.unit[0].duration * choice.variable)
 
         for terms in lecture_loads.values():
@@ -496,17 +608,21 @@ class CPSATSolver:
         choices_by_slot: DefaultDict[tuple, List[object]] = defaultdict(list)
         for choice in choices:
             duration = choice.unit[0].duration
-            for section_id in {member.section_id for member in choice.unit}:
+            section_batches = {
+                (member.section_id, batch)
+                for member in choice.unit for batch in batch_indices(member.batch_label)
+            }
+            for section_id, batch in section_batches:
                 for slot in range(choice.candidate.slot_index, choice.candidate.slot_index + duration):
-                    choices_by_slot[(section_id, choice.candidate.day, slot)].append(choice.variable)
+                    choices_by_slot[(section_id, batch, choice.candidate.day, slot)].append(choice.variable)
 
         occupancy: Dict[tuple, object] = {}
-        for (section_id, day, slot), variables in choices_by_slot.items():
-            occupied = model.NewBoolVar(f"occupied_s{section_id}_{day}_{slot}")
+        for (section_id, batch, day, slot), variables in choices_by_slot.items():
+            occupied = model.NewBoolVar(f"occupied_s{section_id}_b{batch}_{day}_{slot}")
             # C02 makes the sum at most one.  Equality also gives CP-SAT a
             # useful exact definition of the occupancy Boolean.
             model.Add(sum(variables) == occupied)
-            occupancy[(section_id, day, slot)] = occupied
+            occupancy[(section_id, batch, day, slot)] = occupied
         return occupancy
 
     def _add_compact_day_constraints(self, model, occupancy: Dict[tuple, object], cfg: dict) -> None:
@@ -514,14 +630,14 @@ class CPSATSolver:
         consecutive_limit = cfg.get("MAX_CONSECUTIVE_PERIODS", 3)
         allowed_breaks = cfg.get("allowed_break_slots", set())
 
-        sections_days = {(section_id, day) for section_id, day, _ in occupancy}
-        for section_id, day in sections_days:
+        sections_days = {(section_id, batch, day) for section_id, batch, day, _ in occupancy}
+        for section_id, batch, day in sections_days:
             # C11: every run of limit + 1 slots must contain at least one gap.
             for start in range(self.config.slots_per_day - consecutive_limit):
                 terms = [
-                    occupancy[(section_id, day, slot)]
+                    occupancy[(section_id, batch, day, slot)]
                     for slot in range(start, start + consecutive_limit + 1)
-                    if (section_id, day, slot) in occupancy
+                    if (section_id, batch, day, slot) in occupancy
                 ]
                 if terms:
                     model.Add(sum(terms) <= consecutive_limit)
@@ -533,9 +649,9 @@ class CPSATSolver:
             for gap_slot in range(1, self.config.slots_per_day - 1):
                 if (section_id, day, gap_slot) in allowed_breaks:
                     continue
-                before = [occupancy[(section_id, day, slot)] for slot in range(gap_slot) if (section_id, day, slot) in occupancy]
-                after = [occupancy[(section_id, day, slot)] for slot in range(gap_slot + 1, self.config.slots_per_day) if (section_id, day, slot) in occupancy]
-                at_gap = occupancy.get((section_id, day, gap_slot), 0)
+                before = [occupancy[(section_id, batch, day, slot)] for slot in range(gap_slot) if (section_id, batch, day, slot) in occupancy]
+                after = [occupancy[(section_id, batch, day, slot)] for slot in range(gap_slot + 1, self.config.slots_per_day) if (section_id, batch, day, slot) in occupancy]
+                at_gap = occupancy.get((section_id, batch, day, gap_slot), 0)
                 if not before or not after:
                     continue
                 for earlier in before:
@@ -558,14 +674,14 @@ class CPSATSolver:
                     continue
                 if run_start is not None and previous is not None and previous > run_start:
                     before_run = [
-                        occupancy[(section_id, day, index)]
+                        occupancy[(section_id, batch, day, index)]
                         for index in range(run_start)
-                        if (section_id, day, index) in occupancy
+                        if (section_id, batch, day, index) in occupancy
                     ]
                     after_run = [
-                        occupancy[(section_id, day, index)]
+                        occupancy[(section_id, batch, day, index)]
                         for index in range(previous + 1, self.config.slots_per_day)
-                        if (section_id, day, index) in occupancy
+                        if (section_id, batch, day, index) in occupancy
                     ]
                     for earlier in before_run:
                         for later in after_run:
@@ -577,19 +693,19 @@ class CPSATSolver:
         """C20: a section that teaches that day must begin no later than noon."""
         latest_by_day = cfg.get("MAX_SECTION_START_SLOT_BY_DAY", {})
         default_latest = cfg.get("MAX_SECTION_START_SLOT", 3)
-        sections_days = {(section_id, day) for section_id, day, _ in occupancy}
+        sections_days = {(section_id, batch, day) for section_id, batch, day, _ in occupancy}
 
-        for section_id, day in sections_days:
+        for section_id, batch, day in sections_days:
             latest = latest_by_day.get(day, default_latest)
             early = [
-                occupancy[(section_id, day, slot)]
+                occupancy[(section_id, batch, day, slot)]
                 for slot in range(0, min(latest + 1, self.config.slots_per_day))
-                if (section_id, day, slot) in occupancy
+                if (section_id, batch, day, slot) in occupancy
             ]
             late = [
-                occupancy[(section_id, day, slot)]
+                occupancy[(section_id, batch, day, slot)]
                 for slot in range(latest + 1, self.config.slots_per_day)
-                if (section_id, day, slot) in occupancy
+                if (section_id, batch, day, slot) in occupancy
             ]
             for variable in late:
                 if early:
@@ -597,31 +713,91 @@ class CPSATSolver:
                 else:
                     model.Add(variable == 0)
 
+    @staticmethod
+    def _lab_day_count_objective(model, choices: List[_Choice]):
+        """Return the number of section/batch days containing a lab."""
+        lab_choices: DefaultDict[tuple, set] = defaultdict(set)
+        for choice in choices:
+            for member in choice.unit:
+                course_type = str(getattr(member.course_type, "value", member.course_type)).lower()
+                if course_type != "lab":
+                    continue
+                for batch in batch_indices(member.batch_label):
+                    lab_choices[(member.section_id, batch, choice.candidate.day)].add(choice.variable)
+
+        active_lab_days = []
+        for key, variables in lab_choices.items():
+            active = model.NewBoolVar(f"lab_day_{key[0]}_{key[1]}_{key[2]}")
+            for variable in variables:
+                model.Add(variable <= active)
+            model.Add(active <= sum(variables))
+            active_lab_days.append(active)
+        return sum(active_lab_days) if active_lab_days else None
+
     def _add_optional_balance_objective(
         self, model, choices: List[_Choice], cfg: dict, warm_choices: Iterable[_Choice] = (),
     ) -> None:
-        """Prefer a spread, readable week without weakening hard rules."""
+        """Prefer balanced cohorts and well-spread courses.
+
+        Lab consolidation is optimized in a separate higher-priority pass;
+        these existing terms preserve the normal weekly-balance policy.
+        """
         if not cfg.get("PREFER_BALANCED_DAYS", False):
             return
 
-        section_day_choices: DefaultDict[tuple, List[object]] = defaultdict(list)
-        course_day_choices: DefaultDict[tuple, List[object]] = defaultdict(list)
+        cohort_day_choices: DefaultDict[tuple, set] = defaultdict(set)
+        cohort_slot_choices: DefaultDict[tuple, set] = defaultdict(set)
+        course_day_choices: DefaultDict[tuple, set] = defaultdict(set)
+        weekly_cohort_load: DefaultDict[tuple, int] = defaultdict(int)
+        unit_max_room_waste: DefaultDict[int, int] = defaultdict(int)
         room_waste_terms: List[object] = []
+
+        # The weekly demand is fixed by the input.  In a linked unit, more
+        # than one offering can serve the same cohort at the same time (for
+        # example parallel elective options), so count the longest member
+        # once for that cohort rather than double-counting the shared period.
+        units: Dict[int, Tuple[SchedulingSession, ...]] = {}
         for choice in choices:
-            for section_id in {member.section_id for member in choice.unit}:
-                section_day_choices[(section_id, choice.candidate.day)].append(choice.variable)
+            units.setdefault(choice.unit_index, choice.unit)
+        for unit in units.values():
+            unit_cohort_durations: DefaultDict[tuple, int] = defaultdict(int)
+            for member in unit:
+                for batch in batch_indices(member.batch_label):
+                    key = (member.section_id, batch)
+                    unit_cohort_durations[key] = max(unit_cohort_durations[key], member.duration)
+            for key, duration in unit_cohort_durations.items():
+                weekly_cohort_load[key] += duration
+
+        for choice in choices:
+            choice_cohort_durations: DefaultDict[tuple, int] = defaultdict(int)
             for member in choice.unit:
-                course_day_choices[(member.course_id, choice.candidate.day)].append(choice.variable)
+                for batch in batch_indices(member.batch_label):
+                    key = (member.section_id, batch)
+                    choice_cohort_durations[key] = max(choice_cohort_durations[key], member.duration)
+            for (section_id, batch), duration in choice_cohort_durations.items():
+                cohort_day_choices[(section_id, batch, choice.candidate.day)].add(choice.variable)
+                for slot in range(choice.candidate.slot_index, choice.candidate.slot_index + duration):
+                    cohort_slot_choices[(section_id, batch, choice.candidate.day, slot)].add(choice.variable)
+            candidate_room_waste = 0
+            for member in choice.unit:
+                course_day_choices[(member.course_id, choice.candidate.day)].add(choice.variable)
                 room = choice.candidate.room_assignments[member.session_id]
-                room_waste_terms.append(max(0, room.capacity - member.section_strength) * choice.variable)
+                required = max(group_capacity(member.section_strength, member.batch_label), member.program_elective_student_count)
+                candidate_room_waste += max(0, room.capacity - required)
+            room_waste_terms.append(candidate_room_waste * choice.variable)
+            unit_max_room_waste[choice.unit_index] = max(
+                unit_max_room_waste[choice.unit_index], candidate_room_waste,
+            )
 
         active_days: List[object] = []
-        for key, variables in section_day_choices.items():
+        active_day_vars: Dict[tuple, object] = {}
+        for key, variables in cohort_day_choices.items():
             active = model.NewBoolVar(f"section_day_{key[0]}_{key[1]}")
             for variable in variables:
                 model.Add(variable <= active)
             model.Add(active <= sum(variables))
             active_days.append(active)
+            active_day_vars[key] = active
 
         course_days: List[object] = []
         for key, variables in course_day_choices.items():
@@ -631,12 +807,104 @@ class CPSATSolver:
             model.Add(active <= sum(variables))
             course_days.append(active)
 
-        # Primary: use as many working days as the weekly workload permits.
-        # Secondary: spread each course across days.  Room-capacity excess is
-        # only a tie-breaker, so it never creates an unbalanced timetable.
+        # Penalize each cohort for periods concentrated on some days and
+        # missing from others.  Scaling each daily load by the number of days
+        # lets CP-SAT compare it directly with the fixed weekly demand without
+        # introducing fractional averages.
+        days = max(1, len(self.config.days))
+        slot_loads: DefaultDict[tuple, List[object]] = defaultdict(list)
+        for (section_id, batch, day, slot), variables in cohort_slot_choices.items():
+            occupied = model.NewBoolVar(f"cohort_{section_id}_{batch}_{day}_{slot}")
+            model.AddMaxEquality(occupied, list(variables))
+            slot_loads[(section_id, batch, day)].append(occupied)
+
+        daily_load_vars: DefaultDict[tuple, object] = defaultdict(int)
+        for (section_id, batch), weekly_load in weekly_cohort_load.items():
+            if weekly_load <= 0:
+                continue
+            for day in self.config.days:
+                load = model.NewIntVar(0, weekly_load, f"load_{section_id}_{batch}_{day}")
+                model.Add(load == sum(slot_loads.get((section_id, batch, day), ())))
+                daily_load_vars[(section_id, batch, day)] = load
+
+        balance_terms: List[object] = []
+        balance_bound = 0
+        preferred_minimum = max(1, int(cfg.get("PREFERRED_MIN_PERIODS_PER_DAY", 2)))
+        for (section_id, batch), weekly_load in weekly_cohort_load.items():
+            if weekly_load <= 0:
+                continue
+            preferred_shortage_scale = (
+                days * max(preferred_minimum, weekly_load)
+                if cfg.get("PREFER_CLUSTERED_LAB_DAYS", False)
+                else days
+            )
+            for day in self.config.days:
+                load = daily_load_vars[(section_id, batch, day)]
+                active = active_day_vars.get((section_id, batch, day))
+                if (
+                    cfg.get("PREFER_CLUSTERED_LAB_DAYS", False)
+                    and weekly_load >= preferred_minimum * days
+                    and active is not None
+                ):
+                    # This condition is added only to the optional quality
+                    # solve, after a valid timetable has been found. If the
+                    # 2-period target is impossible, the feasible baseline is
+                    # retained unchanged.
+                    model.Add(load >= preferred_minimum).OnlyEnforceIf(active)
+                delta = model.NewIntVar(
+                    -weekly_load * days, weekly_load * days,
+                    f"balance_delta_{section_id}_{batch}_{day}",
+                )
+                model.Add(
+                    delta == days * load - weekly_load
+                )
+                deviation = model.NewIntVar(
+                    0, weekly_load * days, f"balance_deviation_{section_id}_{batch}_{day}"
+                )
+                model.AddAbsEquality(deviation, delta)
+                balance_terms.append(deviation)
+                balance_bound += weekly_load * days * max(0, days - 1)
+
+                # After maximizing active days, prefer at least two periods on
+                # each teaching day when the week's demand and resources allow
+                # it. This is a soft objective (never a hard restriction), so
+                # faculty, room, availability, and coordinator rules remain
+                # authoritative when a fuller day cannot be achieved.
+                shortage = model.NewIntVar(
+                    0, preferred_minimum,
+                    f"preferred_day_shortage_{section_id}_{batch}_{day}",
+                )
+                model.AddMaxEquality(
+                    shortage,
+                    [preferred_minimum - load, 0],
+                )
+                balance_terms.append(preferred_shortage_scale * shortage)
+                balance_bound += preferred_shortage_scale * preferred_minimum
+
+        max_room_waste = sum(unit_max_room_waste.values())
+        max_warm_matches = len({choice.unit_index for choice in warm_choices})
+        max_balance_penalty = balance_bound
+        max_course_days = len(course_days)
+
+        # Choose coefficients from the actual bounds, so every higher-quality
+        # objective tier dominates the full possible range of lower tiers.
+        warm_weight = max_room_waste + 1
+        course_weight = max_warm_matches * warm_weight + max_room_waste + 1
+        balance_weight = (
+            max_course_days * course_weight
+            + max_warm_matches * warm_weight
+            + max_room_waste + 1
+        )
+        active_weight = (
+            max_balance_penalty * balance_weight
+            + max_course_days * course_weight
+            + max_warm_matches * warm_weight
+            + max_room_waste + 1
+        )
         model.Maximize(
-            1000 * sum(active_days)
-            + 100 * sum(course_days)
-            + 1000 * sum(choice.variable for choice in warm_choices)
+            active_weight * sum(active_days)
+            - balance_weight * sum(balance_terms)
+            + course_weight * sum(course_days)
+            + warm_weight * sum(choice.variable for choice in warm_choices)
             - sum(room_waste_terms)
         )

@@ -1,4 +1,4 @@
-from sqlalchemy import Column, Integer, String, Boolean, ForeignKey, Enum as SAEnum
+from sqlalchemy import Column, Integer, String, Boolean, ForeignKey, Enum as SAEnum, JSON
 from sqlalchemy.orm import relationship
 from app.database.session import Base
 import enum
@@ -35,8 +35,11 @@ class Course(Base):
     # NULL = ordinary course, scheduled independently.
     link_group = Column(String(50), nullable=True, index=True)
     # Free-text label for which batches this offering serves, e.g. "B1/B2".
-    # Not used by the solver — for display/reporting only.
+    # Canonical B1/B2 and B3/B4 values scope the offering to those students.
     batch_label = Column(String(50), nullable=True)
+    # `teacher_id` remains the lead/legacy teacher. Paired lab classes may
+    # have a second instructor from the batch-faculty workbook.
+    teacher_ids = Column(JSON, nullable=True)
     # Program electives materialize one course row per participating section;
     # the shared group id makes those rows one teaching/room assignment.
     program_elective_group_id = Column(Integer, ForeignKey("program_elective_groups.id"), nullable=True, index=True)

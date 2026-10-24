@@ -17,6 +17,7 @@ from app.models.timetable import GeneratedSchedule, TimetableSession, ScheduleSt
 from app.models.timeslot import DayOfWeek
 from app.scheduler.constraints.base import ScheduleAssignment
 from app.scheduler.conflict_checker import validate_schedule
+from app.scheduler.batches import group_capacity, teacher_ids as course_teacher_ids
 from app.services.constraint_profiles import get_current_profile
 
 
@@ -80,6 +81,7 @@ def _constraint_config(db: Session) -> Tuple[dict, List[str], int]:
 
     rooms_db = db.query(Room).filter(Room.active == True).all()
     valid_room_ids = {r.id for r in rooms_db if r.active}
+    elective_groups = db.query(ProgramElectiveGroup).all()
 
     latest_start_time = time.fromisoformat(
         constraint_values.get("LATEST_SECTION_START_TIME", settings.MAX_SECTION_START_TIME)
@@ -115,6 +117,14 @@ def _constraint_config(db: Session) -> Tuple[dict, List[str], int]:
         "max_slot_index": slots_per_day - 1,
         "SENIOR_FACULTY_CONSTRAINT_MODE": settings.SENIOR_FACULTY_CONSTRAINT_MODE,
         "expected_sessions_per_course": {},  # filled per-edit when needed
+        "program_elective_group_sections": {
+            group.id: {section.id for section in group.sections}
+            for group in elective_groups
+        },
+        "program_elective_weekly_sessions": {
+            group.id: group.elective.weekly_sessions
+            for group in elective_groups
+        },
         "valid_room_ids": valid_room_ids,
     }
     return config, days, slots_per_day
@@ -133,8 +143,10 @@ def _assignments_for_schedule(db: Session, schedule: GeneratedSchedule) -> Tuple
     } if elective_group_ids else {}
     section_ids = {s.section_id for s in sessions}
     sections = {sec.id: sec for sec in db.query(Section).filter(Section.id.in_(section_ids)).all()} if section_ids else {}
-    teacher_ids = {s.teacher_id for s in sessions}
-    teachers = {t.id: t for t in db.query(Teacher).filter(Teacher.id.in_(teacher_ids)).all()} if teacher_ids else {}
+    teacher_id_set = {s.teacher_id for s in sessions}
+    for course in courses.values():
+        teacher_id_set.update(course_teacher_ids(course.teacher_id, course.teacher_ids))
+    teachers = {t.id: t for t in db.query(Teacher).filter(Teacher.id.in_(teacher_id_set)).all()} if teacher_id_set else {}
     room_ids = {s.room_id for s in sessions}
     rooms = {r.id: r for r in db.query(Room).filter(Room.id.in_(room_ids)).all()} if room_ids else {}
     timeslots = {ts.id: ts for ts in db.query(Timeslot).all()}
@@ -168,6 +180,17 @@ def _assignments_for_schedule(db: Session, schedule: GeneratedSchedule) -> Tuple
         section_strength = sec.strength if sec else 0
         elective_group_id = course.program_elective_group_id if course else None
         elective_group = elective_groups.get(elective_group_id)
+        course_faculty_ids = course_teacher_ids(course.teacher_id, course.teacher_ids) if course else (s.teacher_id,)
+        additional_faculty_ids = [faculty_id for faculty_id in course_faculty_ids if faculty_id != (course.teacher_id if course else s.teacher_id)]
+        scheduled_faculty_ids = course_teacher_ids(s.teacher_id, additional_faculty_ids)
+        faculty_types = {
+            faculty_id: (
+                teachers[faculty_id].faculty_type.value
+                if faculty_id in teachers and hasattr(teachers[faculty_id].faculty_type, "value")
+                else str(getattr(teachers.get(faculty_id), "faculty_type", "regular"))
+            )
+            for faculty_id in scheduled_faculty_ids
+        }
         assignments.append(ScheduleAssignment(
             session_id=str(s.id),
             course_id=s.course_id,
@@ -183,12 +206,22 @@ def _assignments_for_schedule(db: Session, schedule: GeneratedSchedule) -> Tuple
             course_type=str(course_type),
             required_room_type=str(required_room_type),
             faculty_type=str(faculty_type),
-            link_group_id=getattr(course, "link_group", None) if course else None,
+            link_group_id=(
+                f"{s.section_id}:{course.link_group}:{int(s.session_number or 1)}"
+                if course and course.link_group else None
+            ),
             shared_room_group_id=f"PE:{elective_group_id}:{day_val}:{slot_index}" if elective_group_id is not None else None,
-            required_capacity=max(int(section_strength or 0), int(elective_group.student_count if elective_group else 0)),
+            required_capacity=max(
+                group_capacity(int(section_strength or 0), getattr(course, "batch_label", None)),
+                int(elective_group.student_count if elective_group else 0),
+            ),
+            batch_label=getattr(course, "batch_label", None),
+            teacher_ids=list(scheduled_faculty_ids),
+            teacher_faculty_types=faculty_types,
             program_elective_group_id=elective_group_id,
             program_elective_student_count=int(elective_group.student_count if elective_group else 0),
             room_number=str(room_number or ""),
+            session_number=int(s.session_number or 1),
         ))
         session_map[s.id] = s
     return assignments, session_map
@@ -196,7 +229,8 @@ def _assignments_for_schedule(db: Session, schedule: GeneratedSchedule) -> Tuple
 
 def latest_valid_schedule(db: Session) -> Optional[GeneratedSchedule]:
     return db.query(GeneratedSchedule).filter(
-        GeneratedSchedule.status == ScheduleStatus.VALID
+        GeneratedSchedule.status == ScheduleStatus.VALID,
+        GeneratedSchedule.is_stale.is_(False),
     ).order_by(GeneratedSchedule.generated_at.desc()).first()
 
 
@@ -209,7 +243,8 @@ def _find_timeslot(db: Session, day: str, slot_index: int) -> Optional[Timeslot]
 
 
 def preview_move(
-    db: Session, schedule: GeneratedSchedule, session_id: int, new_day: str, new_slot_index: int, new_room_id: Optional[int]
+    db: Session, schedule: GeneratedSchedule, session_id: int, new_day: str, new_slot_index: int,
+    new_room_id: Optional[int], new_teacher_id: Optional[int] = None,
 ) -> dict:
     """Return {valid, violations:[{constraint,message}]} without writing."""
     assignments, session_map = _assignments_for_schedule(db, schedule)
@@ -241,6 +276,16 @@ def preview_move(
     else:
         # keep
         room = room_by_id.get(target_session.room_id)
+
+    teacher_change_requested = new_teacher_id is not None and int(new_teacher_id) != int(target_session.teacher_id)
+    replacement_teacher = None
+    if teacher_change_requested:
+        replacement_teacher = db.query(Teacher).filter(
+            Teacher.id == new_teacher_id,
+            Teacher.active == True,
+        ).first()
+        if replacement_teacher is None:
+            return {"valid": False, "violations": [{"constraint": "C17", "message": "Choose an active faculty member."}]}
 
     # Linked groups: if this course has a link_group, moving one instance should move its whole bundle
     # (e.g. elective cluster). For a preview we validate the full mutated schedule.
@@ -283,6 +328,12 @@ def preview_move(
         if same_slot:
             bundle_ids = same_slot
 
+    if teacher_change_requested and len(bundle_ids) > 1 and elective_group_id is None:
+        return {"valid": False, "violations": [{
+            "constraint": "C17",
+            "message": "This linked class contains different courses. Change faculty on one course at a time, or move the linked class without changing faculty.",
+        }]}
+
     # Build mutated assignments: shift every bundle member to new_day/new_slot (same room unless overridden)
     bundle_set = set(bundle_ids)
     mutated: List[ScheduleAssignment] = []
@@ -300,11 +351,22 @@ def preview_move(
                 return {"valid": False, "violations": [{"constraint": "C03", "message": "A linked group needs distinct rooms — move without forcing a single room."}]}
             member_room_id = new_room_id if (new_room_id is not None and (is_shared_elective or len(bundle_ids) == 1)) else a.room_id
             member_room = room_by_id.get(member_room_id, room)
+            teacher_id = new_teacher_id if teacher_change_requested and (is_shared_elective or len(bundle_ids) == 1) else a.teacher_id
+            teacher_type = replacement_teacher.faculty_type if teacher_id == new_teacher_id and replacement_teacher is not None else a.faculty_type
+            if hasattr(teacher_type, "value"):
+                teacher_type = teacher_type.value
+            assignment_teacher_ids = list(course_teacher_ids(a.teacher_id, a.teacher_ids))
+            faculty_types = dict(a.teacher_faculty_types)
+            if teacher_id != a.teacher_id:
+                remaining_faculty = [faculty_id for faculty_id in assignment_teacher_ids if faculty_id != a.teacher_id]
+                assignment_teacher_ids = list(course_teacher_ids(teacher_id, remaining_faculty))
+                faculty_types.pop(a.teacher_id, None)
+                faculty_types[teacher_id] = str(teacher_type)
             mutated.append(ScheduleAssignment(
                 session_id=a.session_id,
                 course_id=a.course_id,
                 section_id=a.section_id,
-                teacher_id=a.teacher_id,
+                teacher_id=teacher_id,
                 room_id=member_room.id if member_room else a.room_id,
                 day=new_day,
                 slot_index=new_slot_index,
@@ -314,13 +376,16 @@ def preview_move(
                 section_strength=a.section_strength,
                 course_type=a.course_type,
                 required_room_type=a.required_room_type,
-                faculty_type=a.faculty_type,
+                faculty_type=str(teacher_type),
+                teacher_ids=assignment_teacher_ids,
+                teacher_faculty_types=faculty_types,
                 link_group_id=a.link_group_id,
                 shared_room_group_id=(f"PE:{elective_group_id}:{new_day}:{new_slot_index}" if is_shared_elective else a.shared_room_group_id),
                 required_capacity=a.required_capacity,
                 program_elective_group_id=a.program_elective_group_id,
                 program_elective_student_count=a.program_elective_student_count,
                 room_number=str(member_room.room_number if member_room else a.room_number),
+                session_number=a.session_number,
             ))
         else:
             mutated.append(a)
@@ -337,13 +402,16 @@ def preview_move(
 
 
 def apply_move(
-    db: Session, schedule: GeneratedSchedule, session_id: int, new_day: str, new_slot_index: int, new_room_id: Optional[int]
+    db: Session, schedule: GeneratedSchedule, session_id: int, new_day: str, new_slot_index: int,
+    new_room_id: Optional[int], new_teacher_id: Optional[int] = None,
 ) -> dict:
-    preview = preview_move(db, schedule, session_id, new_day, new_slot_index, new_room_id)
+    preview = preview_move(db, schedule, session_id, new_day, new_slot_index, new_room_id, new_teacher_id)
     if not preview["valid"]:
         return preview
     bundle_ids = preview.get("bundle_ids", [session_id])
     shared_elective = preview.get("shared_elective", False)
+    original_session = db.query(TimetableSession).get(session_id)
+    teacher_change_requested = new_teacher_id is not None and original_session is not None and int(new_teacher_id) != int(original_session.teacher_id)
     ts = _find_timeslot(db, new_day, new_slot_index)
     if not ts:
         return {"valid": False, "violations": [{"constraint": "C07", "message": f"No Timeslot for {new_day} slot {new_slot_index}. Create it on the Timeslots page first."}]}
@@ -358,10 +426,12 @@ def apply_move(
         sess.end_time = ts.end_time
         if new_room_id is not None and (len(bundle_ids) == 1 or shared_elective):
             sess.room_id = new_room_id
+        if teacher_change_requested and (len(bundle_ids) == 1 or shared_elective):
+            sess.teacher_id = new_teacher_id
         # For linked lab bundle each member keeps its own room (already validated distinct)
     db.commit()
     refresh_vacancy_cache(db, schedule)
-    return {"valid": True, "violations": [], "bundle_ids": bundle_ids, "timeslot_id": ts.id}
+    return {"valid": True, "violations": [], "bundle_ids": bundle_ids, "timeslot_id": ts.id, "saved": True}
 
 
 def preview_swap(db: Session, schedule: GeneratedSchedule, a_id: int, b_id: int) -> dict:
@@ -439,10 +509,10 @@ def apply_swap(db: Session, schedule: GeneratedSchedule, a_id: int, b_id: int) -
                 row.end_time = target_timeslot.end_time
     db.commit()
     refresh_vacancy_cache(db, schedule)
-    return {"valid": True, "violations": [], "a_bundle_ids": preview["a_bundle_ids"], "b_bundle_ids": preview["b_bundle_ids"]}
+    return {"valid": True, "violations": [], "a_bundle_ids": preview["a_bundle_ids"], "b_bundle_ids": preview["b_bundle_ids"], "saved": True}
 
 
-def refresh_vacancy_cache(db: Session, schedule: GeneratedSchedule) -> None:
+def refresh_vacancy_cache(db: Session, schedule: GeneratedSchedule, broadcast: bool = True) -> None:
     """Rebuild the in-memory vacancy cache from the current schedule."""
     try:
         from app.vacancy.cache import occupancy_cache
@@ -494,16 +564,17 @@ def refresh_vacancy_cache(db: Session, schedule: GeneratedSchedule) -> None:
         occupancy_cache.load_schedule(cache_rows)
         occupancy_cache.update_current(datetime.now())
         # broadcast if anyone listening (best-effort)
-        try:
-            from app.websocket.manager import ws_manager
-            import asyncio
+        if broadcast:
             try:
-                loop = asyncio.get_running_loop()
-                loop.create_task(ws_manager.broadcast({"event": "SCHEDULE_UPDATED", "schedule_id": schedule.id}))
-            except RuntimeError:
+                from app.websocket.manager import ws_manager
+                import asyncio
+                try:
+                    loop = asyncio.get_running_loop()
+                    loop.create_task(ws_manager.broadcast({"event": "SCHEDULE_UPDATED", "schedule_id": schedule.id}))
+                except RuntimeError:
+                    pass
+            except Exception:
                 pass
-        except Exception:
-            pass
     except Exception:
         # never fail the edit because vacancy refresh had an issue
         pass

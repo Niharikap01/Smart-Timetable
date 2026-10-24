@@ -1,5 +1,6 @@
 from typing import List
 from .base import Constraint, ConstraintResult, ScheduleAssignment
+from app.scheduler.batches import assignments_share_students
 
 
 class SectionConflictConstraint(Constraint):
@@ -8,7 +9,7 @@ class SectionConflictConstraint(Constraint):
 
     def check(self, candidate: ScheduleAssignment, existing: List[ScheduleAssignment], config: dict) -> ConstraintResult:
         for a in existing:
-            if a.section_id == candidate.section_id and a.day == candidate.day:
+            if assignments_share_students(a, candidate) and a.day == candidate.day:
                 # Same link_group (both set, and equal) means these are
                 # intentionally-parallel offerings (elective split / lab
                 # pair) sharing the section's slot on purpose — not a clash.
@@ -27,7 +28,7 @@ class SectionConflictConstraint(Constraint):
         results = []
         for i, a in enumerate(assignments):
             for b in assignments[i + 1:]:
-                if a.section_id == b.section_id and a.day == b.day:
+                if assignments_share_students(a, b) and a.day == b.day:
                     if a.link_group_id is not None and a.link_group_id == b.link_group_id:
                         continue
                     a_slots = set(range(a.slot_index, a.slot_index + a.duration))

@@ -2,7 +2,8 @@ from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from app.core.config import settings
 from app.api.routes import api_router
-from app.api.routes.vacancy import router as vacancy_router
+from app.api.routes.vacancy import router as vacancy_router, refresh_cache_from_database
+from app.database.session import SessionLocal
 from app.websocket.manager import ws_manager
 from app.vacancy.cache import occupancy_cache
 
@@ -31,6 +32,12 @@ def health_check():
 
 @app.websocket("/ws/vacancy")
 async def vacancy_ws(ws: WebSocket):
+    db = SessionLocal()
+    try:
+        refresh_cache_from_database(db)
+    finally:
+        db.close()
+
     await ws_manager.connect(ws)
     try:
         # Send current state on connect

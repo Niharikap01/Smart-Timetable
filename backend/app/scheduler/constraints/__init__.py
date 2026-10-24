@@ -19,6 +19,8 @@ from .c17_teacher_daily_hours import TeacherDailyHoursConstraint
 from .c18_honours_slot import HonoursSlotConstraint
 from .c19_section_gaps import SectionGapsConstraint
 from .c20_section_start_time import SectionStartTimeConstraint
+from .c21_program_elective_sync import ProgramElectiveSynchronizationConstraint
+from .c22_no_repeat_lecture_day import NoRepeatLecturePerDayConstraint
 
 
 ALL_CONSTRAINTS = [
@@ -42,6 +44,8 @@ ALL_CONSTRAINTS = [
     HonoursSlotConstraint(),
     SectionGapsConstraint(),
     SectionStartTimeConstraint(),
+    ProgramElectiveSynchronizationConstraint(),
+    NoRepeatLecturePerDayConstraint(),
 ]
 
 

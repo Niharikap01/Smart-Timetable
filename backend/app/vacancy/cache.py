@@ -42,6 +42,7 @@ class OccupancyCache:
         self._schedule: List[dict] = []
 
     def load_rooms(self, rooms: List[dict]):
+        self._rooms = {}
         for r in rooms:
             self._rooms[r["room_id"]] = RoomStatus(
                 r["room_id"], r["room_number"], r["room_type"], r["capacity"]

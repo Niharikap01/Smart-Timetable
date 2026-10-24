@@ -28,6 +28,9 @@ class SchedulingSession:
     program_elective_group_id: Optional[int] = None
     program_elective_student_count: int = 0
     shared_room_group_id: Optional[str] = None
+    batch_label: Optional[str] = None
+    teacher_ids: Tuple[int, ...] = ()
+    teacher_faculty_types: Dict[int, str] = field(default_factory=dict)
 
 
 @dataclass
